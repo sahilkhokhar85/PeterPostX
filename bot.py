@@ -241,10 +241,13 @@ MENU = kb(
         [("📺 My Channels", "chs")],
     ]
 )
+
+
 MENU_TEXT = (
-    "👋 <b>PeterPostX</b>\n"
-    "Schedule posts to your channels with timers and auto-delete.\n\n"
-    "Choose an option:"
+    "👋 <b>Welcome!</b>\n\n"
+    "Schedule posts to your channels, set auto-delete timers and manage everything from one place.\n\n"
+    "⏰ Timed · 🗑 Auto-delete · ✏️ Editable\n\n"
+    "Choose an option below 👇"
 )
 
 CONTENT_PROMPT = (
@@ -286,8 +289,8 @@ def del_text(live=False):
 def del_kb(prefix, cancel_text, cancel_cb):
     return kb(
         [
-            [("🚫 None", f"{prefix}0"), ("1h", f"{prefix}3600"), ("6h", f"{prefix}21600"), ("12h", f"{prefix}43200")],
-            [("24h", f"{prefix}86400"), ("48h", f"{prefix}172800"), ("7d", f"{prefix}604800"), (cancel_text, cancel_cb)],
+            [("🚫 None", f"{prefix}0"), ("⏱ 1h", f"{prefix}3600"), ("⏱ 6h", f"{prefix}21600"), ("⏱ 12h", f"{prefix}43200")],
+            [("📅 24h", f"{prefix}86400"), ("📅 48h", f"{prefix}172800"), ("📅 7d", f"{prefix}604800"), (cancel_text, cancel_cb)],
         ]
     )
 
@@ -305,12 +308,13 @@ async def not_owner(m: Message):
 
 # ----------------------------------------------------------------- menu & commands
 async def show_menu(ev):
+    text = MENU_TEXT
     if isinstance(ev, CallbackQuery):
         await safe_answer(ev)
         msg = ev.message
         if getattr(msg, "photo", None):
             try:
-                await msg.edit_caption(caption=MENU_TEXT, reply_markup=MENU)
+                await msg.edit_caption(caption=text, reply_markup=MENU)
                 return
             except TelegramBadRequest as e:
                 if "not modified" in str(e):
@@ -323,10 +327,10 @@ async def show_menu(ev):
     else:
         target = ev
     try:
-        await target.answer_photo(photo=START_IMAGE, caption=MENU_TEXT, reply_markup=MENU)
+        await target.answer_photo(photo=START_IMAGE, caption=text, reply_markup=MENU)
     except Exception:
         log.warning("Could not send start image, falling back to text")
-        await target.answer(MENU_TEXT, reply_markup=MENU)
+        await target.answer(text, reply_markup=MENU)
 
 
 @router.message(CommandStart())
@@ -694,7 +698,7 @@ def nav_row(prefix, page, pages, cid):
     nav = []
     if page > 0:
         nav.append(("⬅️", f"{prefix}:{page - 1}:{cid}"))
-    nav.append((f"{page + 1}/{pages}", "noop"))
+    nav.append((f"📄 {page + 1}/{pages}", "noop"))
     if page < pages - 1:
         nav.append(("➡️", f"{prefix}:{page + 1}:{cid}"))
     return nav
