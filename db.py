@@ -1,149 +1,127 @@
-import json
 import os
 
-import aiosqlite
+from motor.motor_asyncio import AsyncIOMotorClient
 
-DB_PATH = os.getenv("DB_PATH", "data/bot.db")
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS channels (
-    chat_id INTEGER PRIMARY KEY,
-    title TEXT NOT NULL,
-    username TEXT
-);
-CREATE TABLE IF NOT EXISTS posts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    owner_id INTEGER NOT NULL,
-    chat_id INTEGER NOT NULL,
-    content TEXT NOT NULL,
-    link_preview INTEGER NOT NULL DEFAULT 0,
-    silent INTEGER NOT NULL DEFAULT 0,
-    send_at INTEGER NOT NULL,
-    delete_after INTEGER,
-    delete_at INTEGER,
-    sent_at INTEGER,
-    message_id INTEGER,
-    status TEXT NOT NULL DEFAULT 'scheduled',
-    error TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_posts_status ON posts(status, send_at);
-"""
+MONGO_URI = os.getenv("MONGODB_URI") or os.getenv("MONGO_URL") or os.getenv("MONGODB_URL")
+DB_NAME = os.getenv("MONGODB_DB", "peterpostx")
 
 # Posts that still need attention: waiting to be posted, failed, or live with a delete timer.
-ACTIVE = (
-    "(p.status IN ('scheduled','failed') "
-    "OR (p.status='sent' AND p.delete_at IS NOT NULL))"
-)
+ACTIVE = {
+    "$or": [
+        {"status": {"$in": ["scheduled", "failed"]}},
+        {"status": "sent", "delete_at": {"$ne": None}},
+    ]
+}
 
 
-def _post(row):
-    if row is None:
+def _post(doc):
+    if doc is None:
         return None
-    d = dict(row)
-    d["content"] = json.loads(d["content"])
+    d = dict(doc)
+    d["id"] = d.pop("_id")
     return d
 
 
 class DB:
-    conn: aiosqlite.Connection
-
     async def init(self):
-        folder = os.path.dirname(DB_PATH)
-        if folder:
-            os.makedirs(folder, exist_ok=True)
-        self.conn = await aiosqlite.connect(DB_PATH)
-        self.conn.row_factory = aiosqlite.Row
-        await self.conn.executescript(SCHEMA)
-        await self.conn.commit()
-
-    async def _q(self, sql, args=()):
-        cur = await self.conn.execute(sql, args)
-        rows = await cur.fetchall()
-        await cur.close()
-        return rows
-
-    async def _x(self, sql, args=()):
-        cur = await self.conn.execute(sql, args)
-        await self.conn.commit()
-        n, last = cur.rowcount, cur.lastrowid
-        await cur.close()
-        return n, last
+        if not MONGO_URI:
+            raise SystemExit("Set MONGODB_URI (your MongoDB connection string).")
+        self.client = AsyncIOMotorClient(MONGO_URI)
+        await self.client.admin.command("ping")
+        self.db = self.client[DB_NAME]
+        await self.db.posts.create_index([("status", 1), ("send_at", 1)])
 
     # ---- channels ----
     async def add_channel(self, chat_id, title, username):
-        await self._x(
-            "INSERT OR REPLACE INTO channels (chat_id, title, username) VALUES (?,?,?)",
-            (chat_id, title, username),
+        await self.db.channels.update_one(
+            {"_id": chat_id},
+            {"$set": {"title": title, "username": username}},
+            upsert=True,
         )
 
     async def remove_channel(self, chat_id):
-        await self._x("DELETE FROM channels WHERE chat_id=?", (chat_id,))
+        await self.db.channels.delete_one({"_id": chat_id})
 
     async def channels(self):
-        return [dict(r) for r in await self._q("SELECT * FROM channels ORDER BY title")]
+        docs = await self.db.channels.find().sort("title", 1).to_list(None)
+        return [{"chat_id": d["_id"], "title": d["title"], "username": d.get("username")} for d in docs]
 
     async def channel(self, chat_id):
-        rows = await self._q("SELECT * FROM channels WHERE chat_id=?", (chat_id,))
-        return dict(rows[0]) if rows else None
+        d = await self.db.channels.find_one({"_id": chat_id})
+        if not d:
+            return None
+        return {"chat_id": d["_id"], "title": d["title"], "username": d.get("username")}
 
     # ---- posts ----
+    async def _next_id(self):
+        d = await self.db.counters.find_one_and_update(
+            {"_id": "posts"}, {"$inc": {"n": 1}}, upsert=True, return_document=True
+        )
+        return d["n"]
+
     async def create_post(self, **f):
-        f["content"] = json.dumps(f["content"], ensure_ascii=False)
-        cols = ", ".join(f)
-        marks = ", ".join("?" for _ in f)
-        _, last = await self._x(f"INSERT INTO posts ({cols}) VALUES ({marks})", tuple(f.values()))
-        return last
+        pid = await self._next_id()
+        doc = {
+            "_id": pid,
+            "link_preview": 0,
+            "silent": 0,
+            "delete_after": None,
+            "delete_at": None,
+            "sent_at": None,
+            "message_id": None,
+            "status": "scheduled",
+            "error": None,
+        }
+        doc.update(f)
+        await self.db.posts.insert_one(doc)
+        return pid
 
     async def post(self, pid):
-        rows = await self._q("SELECT * FROM posts WHERE id=?", (pid,))
-        return _post(rows[0]) if rows else None
+        return _post(await self.db.posts.find_one({"_id": pid}))
 
     async def set(self, pid, **f):
-        if "content" in f:
-            f["content"] = json.dumps(f["content"], ensure_ascii=False)
-        cols = ", ".join(f"{k}=?" for k in f)
-        await self._x(f"UPDATE posts SET {cols} WHERE id=?", (*f.values(), pid))
+        await self.db.posts.update_one({"_id": pid}, {"$set": f})
 
     async def delete_post(self, pid):
-        await self._x("DELETE FROM posts WHERE id=?", (pid,))
+        await self.db.posts.delete_one({"_id": pid})
 
     async def claim(self, pid):
-        n, _ = await self._x(
-            "UPDATE posts SET status='sending' WHERE id=? AND status='scheduled'", (pid,)
+        r = await self.db.posts.update_one(
+            {"_id": pid, "status": "scheduled"}, {"$set": {"status": "sending"}}
         )
-        return n == 1
+        return r.modified_count == 1
 
     async def reset_sending(self):
-        await self._x("UPDATE posts SET status='scheduled' WHERE status='sending'")
+        await self.db.posts.update_many({"status": "sending"}, {"$set": {"status": "scheduled"}})
 
     async def due_posts(self, now):
-        rows = await self._q(
-            "SELECT * FROM posts WHERE status='scheduled' AND send_at<=? ORDER BY send_at", (now,)
-        )
-        return [_post(r) for r in rows]
+        docs = await self.db.posts.find(
+            {"status": "scheduled", "send_at": {"$lte": now}}
+        ).sort("send_at", 1).to_list(None)
+        return [_post(d) for d in docs]
 
     async def due_deletes(self, now):
-        rows = await self._q(
-            "SELECT * FROM posts WHERE status='sent' AND delete_at IS NOT NULL AND delete_at<=?",
-            (now,),
-        )
-        return [_post(r) for r in rows]
+        docs = await self.db.posts.find(
+            {"status": "sent", "delete_at": {"$ne": None, "$lte": now}}
+        ).to_list(None)
+        return [_post(d) for d in docs]
 
     async def count_active(self):
-        rows = await self._q(f"SELECT COUNT(*) AS n FROM posts p WHERE {ACTIVE}")
-        return rows[0]["n"]
+        return await self.db.posts.count_documents(ACTIVE)
 
     async def active(self, limit, offset):
-        rows = await self._q(
-            f"""SELECT p.*, c.title AS ch_title FROM posts p
-                LEFT JOIN channels c ON c.chat_id = p.chat_id
-                WHERE {ACTIVE}
-                ORDER BY (p.status='sent'),
-                         CASE WHEN p.status='sent' THEN p.delete_at ELSE p.send_at END
-                LIMIT ? OFFSET ?""",
-            (limit, offset),
+        docs = await self.db.posts.find(ACTIVE).to_list(None)
+        posts = [_post(d) for d in docs]
+        titles = {c["chat_id"]: c["title"] for c in await self.channels()}
+        for p in posts:
+            p["ch_title"] = titles.get(p["chat_id"])
+        posts.sort(
+            key=lambda p: (
+                p["status"] == "sent",
+                p["delete_at"] if p["status"] == "sent" else p["send_at"],
+            )
         )
-        return [_post(r) for r in rows]
+        return posts[offset : offset + limit]
 
 
 db = DB()
