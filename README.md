@@ -18,18 +18,19 @@ and a full manager for scheduled posts.
 1. Create a bot with @BotFather and copy the token.
 2. Push this folder to a GitHub repo.
 3. On Railway: New Project > Deploy from GitHub repo.
-4. Add a **Volume** to the service, mount path `/data` (keeps your database across deploys).
+4. Create a MongoDB database (MongoDB Atlas free tier, or the Railway MongoDB plugin) and copy the connection string.
 5. Set variables:
    - `BOT_TOKEN`
-   - `OWNER_IDS` (your Telegram ID; run the bot once and send `/id` to it if you don't know it)
+   - `MONGODB_URI` (connection string)
+   - `OWNER_IDS` (your Telegram ID; leave empty on first run, send `/id` to the bot, then set it and redeploy)
    - `TIMEZONE` (default `Asia/Kolkata`)
-   - `DB_PATH=/data/bot.db`
+   - `MONGODB_DB` (optional, default `peterpostx`)
 6. Start command: `python bot.py` (the Procfile already has it). Deploy.
 7. Add the bot as **admin** of your channel with "Post messages" and "Delete messages" permissions.
    The channel is detected automatically. Or use My Channels > Add Channel.
 
 ## Notes
-- Without a Volume the database is lost on every redeploy.
+- All data is stored in MongoDB, so redeploys do not lose scheduled posts.
 - If the bot was offline at a scheduled time, the post is published as soon as it is back online.
 - Telegram may refuse to delete very old messages (around 48 hours); the bot will notify you if that happens.
 - Albums (multiple photos in one message) are not supported.
