@@ -12,6 +12,8 @@ and a full manager for scheduled posts.
   preview, post now, delete. Live posts with a pending delete timer are listed too.
 - Silent (no notification) option
 - Failed posts are kept so you can retry or edit them
+- Edit already-published posts (text/caption) from Scheduled > channel > Published Posts
+- Commands: /start /new /scheduled /channels /cancel /id
 - Owner-only access
 
 ## Setup
