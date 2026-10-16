@@ -873,7 +873,7 @@ async def scheduler(bot: Bot):
 
 async def main():
     if not OWNERS:
-        raise SystemExit("Set OWNER_IDS (your Telegram user ID). Send /id to the bot to find it.")
+        log.warning("OWNER_IDS is empty. Send /id to the bot, then set OWNER_IDS and redeploy.")
     await db.init()
     await db.reset_sending()
     bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
