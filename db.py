@@ -113,7 +113,7 @@ class DB:
     async def due_posts(self, now):
         docs = await self.db.posts.find(
             {"status": "scheduled", "send_at": {"$lte": now}}
-        ).sort("send_at", 1).to_list(None)
+        ).sort([("send_at", 1), ("_id", 1)]).to_list(None)
         return [_post(d) for d in docs]
 
     async def due_deletes(self, now):
