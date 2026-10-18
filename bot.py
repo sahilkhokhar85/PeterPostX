@@ -20,6 +20,10 @@ from aiogram.types import (
     ChatMemberUpdated,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaAudio,
+    InputMediaDocument,
+    InputMediaPhoto,
+    InputMediaVideo,
     LinkPreviewOptions,
     Message,
 )
@@ -196,6 +200,8 @@ def plain(c, n=80):
         t = t[:n] + "…"
     if c["type"] == "text":
         return t or "(empty)"
+    if c["type"] == "album":
+        return f"[album x{len(c['items'])}] {t}".strip()
     return f"[{c['type']}] {t}".strip()
 
 
@@ -211,9 +217,60 @@ def extract(m: Message):
     return None
 
 
+ALBUMS = {}
+SEEN_ALBUMS = set()
+SKIP = object()
+ALBUM_TYPES = ("photo", "video", "document", "audio")
+ALBUM_MEDIA = {
+    "photo": InputMediaPhoto,
+    "video": InputMediaVideo,
+    "document": InputMediaDocument,
+    "audio": InputMediaAudio,
+}
+
+
+def album_item(m):
+    for t in ALBUM_TYPES:
+        obj = getattr(m, t, None)
+        if obj:
+            return {"type": t, "file_id": obj[-1].file_id if t == "photo" else obj.file_id}
+    return None
+
+
+async def gather_album(m):
+    """Telegram sends an album as separate messages. The first one waits briefly and collects them all.
+    Returns the content dict (first message only), SKIP (other messages of the album) or None (unsupported)."""
+    gid = m.media_group_id
+    first = gid not in ALBUMS
+    ALBUMS.setdefault(gid, {"msgs": []})["msgs"].append(m)
+    if not first:
+        return SKIP
+    await asyncio.sleep(1.2)
+    msgs = sorted(ALBUMS.pop(gid)["msgs"], key=lambda x: x.message_id)
+    items = [album_item(x) for x in msgs]
+    if any(i is None for i in items):
+        return None
+    caption = next((x.html_text for x in msgs if x.caption), None)
+    if len(items) == 1:
+        return {**items[0], "text": caption}
+    return {"type": "album", "items": items, "text": caption}
+
+
+async def get_content(m):
+    if m.media_group_id:
+        return await gather_album(m)
+    return extract(m)
+
+
 async def send_content(bot: Bot, chat_id, c, preview, silent):
     kw = {"chat_id": chat_id, "disable_notification": bool(silent)}
     t = c["type"]
+    if t == "album":
+        media = [
+            ALBUM_MEDIA[it["type"]](media=it["file_id"], caption=c.get("text") if i == 0 else None)
+            for i, it in enumerate(c["items"])
+        ]
+        return await bot.send_media_group(media=media, **kw)  # returns a list of messages
     if t == "text":
         return await bot.send_message(
             text=c["text"], link_preview_options=LinkPreviewOptions(is_disabled=not preview), **kw
@@ -221,6 +278,12 @@ async def send_content(bot: Bot, chat_id, c, preview, silent):
     if t in NO_TEXT_TYPES:
         return await getattr(bot, f"send_{t}")(**{t: c["file_id"]}, **kw)
     return await getattr(bot, f"send_{t}")(**{t: c["file_id"]}, caption=c.get("text"), **kw)
+
+
+async def delete_live(bot: Bot, p):
+    """Delete a post from the channel (all messages, for albums)."""
+    ids = p.get("message_ids") or [p["message_id"]]
+    await bot.delete_messages(chat_id=p["chat_id"], message_ids=ids)
 
 
 async def live_edit(bot: Bot, p):
@@ -308,12 +371,7 @@ def menu_text(user):
     )
 
 
-CONTENT_PROMPT = (
-    "Send the message you want to post.\n\n"
-    "Supported: text, photo, video, document, GIF, audio, voice, sticker. "
-    "Formatting and captions are preserved.\n"
-    "Send one message at a time (albums are not supported)."
-)
+CONTENT_PROMPT = "Send the message you want to post."
 NO_CHANNELS = "You Have No Channels Yet. Add One First."
 
 
@@ -611,9 +669,9 @@ async def np_channel(cb: CallbackQuery, state: FSMContext):
 
 @router.message(NewPost.content)
 async def np_content(m: Message, state: FSMContext):
-    if m.media_group_id:
-        return await reply(m, "Albums are not supported. Please send a single message.")
-    c = extract(m)
+    c = await get_content(m)
+    if c is SKIP:
+        return
     if not c:
         return await reply(m, 
             "This message type is not supported. Send text, photo, video, document, GIF, "
@@ -1004,7 +1062,7 @@ async def cb_delnow_yes(cb: CallbackQuery, bot: Bot):
     if not p or p["status"] != "sent":
         return await show(cb, "Post not found or not live.", kb([[("⬅️ Back", "sch")]]))
     try:
-        await bot.delete_message(p["chat_id"], p["message_id"])
+        await delete_live(bot, p)
     except Exception as e:
         if "not found" not in str(e).lower():
             return await show(cb, f"Could not delete: <code>{esc(e)}</code>", kb([[("⬅️ Back", f"p:{pid}")]]))
@@ -1046,9 +1104,9 @@ async def pe_content(cb: CallbackQuery, state: FSMContext):
 @router.message(EditPost.content)
 async def ep_content(m: Message, state: FSMContext):
     pid = (await state.get_data())["post_id"]
-    if m.media_group_id:
-        return await reply(m, "Albums are not supported. Please send a single message.")
-    c = extract(m)
+    c = await get_content(m)
+    if c is SKIP:
+        return
     if not c:
         return await reply(m, "This message type is not supported.")
     p = await db.post(pid)
@@ -1321,9 +1379,9 @@ async def np_to_repeat(cb: CallbackQuery, state: FSMContext):
 
 @router.message(RepeatNew.content)
 async def rp_content(m: Message, state: FSMContext):
-    if m.media_group_id:
-        return await reply(m, "Albums are not supported. Please send a single message.")
-    c = extract(m)
+    c = await get_content(m)
+    if c is SKIP:
+        return
     if not c:
         return await reply(
             m,
@@ -1776,9 +1834,9 @@ async def re_times(m: Message, state: FSMContext):
 @router.message(RepeatEdit.content)
 async def re_content(m: Message, state: FSMContext):
     rid = (await state.get_data())["rid"]
-    if m.media_group_id:
-        return await reply(m, "Albums are not supported. Please send a single message.")
-    c = extract(m)
+    c = await get_content(m)
+    if c is SKIP:
+        return
     if not c:
         return await reply(m, "This message type is not supported.")
     await state.clear()
@@ -1858,6 +1916,12 @@ async def fire_repeat(bot: Bot, r):
 # ---- fallbacks (must stay last)
 @router.message()
 async def fallback_msg(m: Message):
+    if m.media_group_id:
+        if m.media_group_id in SEEN_ALBUMS:
+            return
+        SEEN_ALBUMS.add(m.media_group_id)
+        if len(SEEN_ALBUMS) > 500:
+            SEEN_ALBUMS.clear()
     await reply(m, "Use /start to open the menu.")
 
 
@@ -1896,7 +1960,16 @@ async def publish(bot: Bot, p):
         return
     now = int(time.time())
     da = now + p["delete_after"] if p["delete_after"] else None
-    await db.set(p["id"], status="sent", message_id=msg.message_id, sent_at=now, delete_at=da, error=None)
+    msgs = msg if isinstance(msg, list) else [msg]
+    await db.set(
+        p["id"],
+        status="sent",
+        message_id=msgs[0].message_id,
+        message_ids=[x.message_id for x in msgs],
+        sent_at=now,
+        delete_at=da,
+        error=None,
+    )
     ch = await db.channel(p["chat_id"])
     text = f"✅ Posted to <b>{esc(ch['title']) if ch else p['chat_id']}</b>\n📝 {esc(plain(p['content'], 60))}"
     if da:
@@ -1907,7 +1980,7 @@ async def publish(bot: Bot, p):
     if p.get("replace_prev") and p.get("repeat_id"):
         for old in await db.live_of_repeat(p["repeat_id"], p["id"]):
             try:
-                await bot.delete_message(old["chat_id"], old["message_id"])
+                await delete_live(bot, old)
             except Exception as e:
                 if "not found" not in str(e).lower():
                     log.warning("Could not replace previous post %s: %s", old["id"], e)
@@ -1916,7 +1989,7 @@ async def publish(bot: Bot, p):
 
 async def remove_live(bot: Bot, p):
     try:
-        await bot.delete_message(p["chat_id"], p["message_id"])
+        await delete_live(bot, p)
     except TelegramRetryAfter:
         return
     except Exception as e:
