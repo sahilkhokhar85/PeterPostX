@@ -5,6 +5,7 @@ and a full manager for scheduled posts.
 
 ## Features
 - Pick the channel from buttons, then send any message (text, photo, video, document, GIF, audio, voice, sticker, album)
+- Send as many messages as you want for one go, then tap Done (Undo Last removes the last one). Each message becomes its own post and they are published in the order you sent them
 - Schedule with a time (`18:30`, `6:30pm`, `25-12-2026 18:30`) or a delay (`30m`, `2h`, `1d 6h`), or post now
 - Auto-delete timer (presets or custom)
 - Link preview ON/OFF, asked every time a post contains a link
