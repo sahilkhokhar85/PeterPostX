@@ -18,6 +18,7 @@ and a full manager for scheduled posts.
   an end rule (never / after N posts / on a date picked from a calendar), auto-delete, and "Replace previous"
   (the old post is deleted when the new one goes out). Pause, resume, skip next, edit message/days/times, send now.
 - Status message when a post goes out: "Posting... Please wait", then "Posted to <channel>"
+- Every screen has a Back button; after Send Now the auto-delete question shows an image (DELETE_IMAGE variable)
 - All bot messages are bold; monospace parts stay monospace
 - Commands: /start /new /repeat /scheduled /channels /cancel /id
 - Owner-only access
