@@ -251,10 +251,11 @@ class DB:
             out.append(r)
         return out
 
-    async def live_of_repeat(self, repeat_id, exclude_id):
-        docs = await self.db.posts.find(
-            {"repeat_id": repeat_id, "status": "sent", "_id": {"$ne": exclude_id}}
-        ).to_list(None)
+    async def live_of_repeat(self, repeat_id, exclude_id, run_id=None):
+        q = {"repeat_id": repeat_id, "status": "sent", "_id": {"$ne": exclude_id}}
+        if run_id is not None:
+            q["run_id"] = {"$ne": run_id}  # never delete posts of the run that is being published
+        docs = await self.db.posts.find(q).to_list(None)
         return [_post(d) for d in docs]
 
 
