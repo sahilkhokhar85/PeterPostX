@@ -292,17 +292,21 @@ class RepeatEdit(StatesGroup):
 MENU = kb(
     [
         [("➕ New Post", "new"), ("🔁 Repeat", "rep")],
-        [("📋 Scheduled", "sch"), ("📺 My Channels", "chs")],
+        [("🗓 Scheduled", "sch"), ("📢 My Channels", "chs")],
     ]
 )
 
 
-MENU_TEXT = (
-    "👋 <b>Welcome!</b>\n\n"
-    "Schedule posts to your channels, set auto-delete timers and manage everything from one place.\n\n"
-    "⏰ Timed · 🗑 Auto-delete · ✏️ Editable\n\n"
-    "Choose an option below 👇"
-)
+def menu_text(user):
+    name = esc(user.first_name or "there")
+    return (
+        f'Hey <a href="tg://user?id={user.id}">{name}</a> !! 💌\n\n'
+        "💫 Welcome To The Post Scheduler Bot! ❤️✨\n\n"
+        "Schedule Posts To Your Channels, Set Auto-Delete Timers And Manage Everything From One Place.\n\n"
+        "⏰ Timed · 🗑 Auto-Delete · ✏️ Editable\n\n"
+        "👇 Choose An Option Below."
+    )
+
 
 CONTENT_PROMPT = (
     "Send the message you want to post.\n\n"
@@ -310,7 +314,7 @@ CONTENT_PROMPT = (
     "Formatting and captions are preserved.\n"
     "Send one message at a time (albums are not supported)."
 )
-NO_CHANNELS = "You have no channels yet. Add one first."
+NO_CHANNELS = "You Have No Channels Yet. Add One First."
 
 
 def when_text():
@@ -367,7 +371,7 @@ async def not_owner(m: Message):
 
 # ----------------------------------------------------------------- menu & commands
 async def show_menu(ev):
-    text = bold(MENU_TEXT)
+    text = bold(menu_text(ev.from_user))
     if isinstance(ev, CallbackQuery):
         await safe_answer(ev)
         msg = ev.message
@@ -434,10 +438,10 @@ async def cmd_repeat(m: Message, state: FSMContext):
 async def channels_screen(ev, state):
     await state.clear()
     chans = await db.channels()
-    text = "📺 <b>My Channels</b>\n\n" + (
-        "Select a channel to manage it." if chans else "No channels added yet."
+    text = "📢 <b>My Channels !!</b>\n\n" + (
+        "Select A Channel To Manage It:" if chans else "No Channels Added Yet."
     )
-    rows = [[(f"📺 {c['title']}", f"ch:{c['chat_id']}")] for c in chans]
+    rows = [[(c["title"], f"ch:{c['chat_id']}")] for c in chans]
     rows.append([("➕ Add Channel", "addch")])
     rows.append([("⬅️ Back", "menu")])
     await show(ev, text, kb(rows))
@@ -590,9 +594,9 @@ async def new_chooser(ev, state):
         return await show(
             ev, NO_CHANNELS, kb([[("➕ Add Channel", "addch")], [("⬅️ Back", "menu")]])
         )
-    rows = [[(f"📺 {c['title']}", f"np_ch:{c['chat_id']}")] for c in chans]
+    rows = [[(c["title"], f"np_ch:{c['chat_id']}")] for c in chans]
     rows.append([("⬅️ Back", "menu")])
-    await show(ev, "➕ <b>New Post</b>\n\nSelect the channel to post in:", kb(rows))
+    await show(ev, "➕ <b>New Post !!</b>\n\nSelect The Channel To Post In:", kb(rows))
 
 
 @router.callback_query(F.data == "new")
@@ -742,12 +746,12 @@ async def sch_chooser(ev, state):
             ev, NO_CHANNELS, kb([[("➕ Add Channel", "addch")], [("⬅️ Back", "menu")]])
         )
     counts = await db.counts_by_channel()
-    rows = [[(f"📋 All Channels ({sum(counts.values())})", "list:0:0")]]
-    rows += [[(f"📺 {c['title']} ({counts.get(c['chat_id'], 0)})", f"list:0:{c['chat_id']}")] for c in chans]
+    rows = [[(f"All Channels ({sum(counts.values())})", "list:0:0")]]
+    rows += [[(f"{c['title']} ({counts.get(c['chat_id'], 0)})", f"list:0:{c['chat_id']}")] for c in chans]
     rows.append([("⬅️ Back", "menu")])
     await show(
         ev,
-        "📋 <b>Scheduled Posts</b>\n\nSelect a channel (number = pending posts):",
+        "🗓 <b>Scheduled Posts !!</b>\n\nSelect A Channel (Number = Pending Posts):",
         kb(rows),
     )
 
@@ -1276,9 +1280,9 @@ async def rep_chooser(ev, state):
     chans = await db.channels()
     if not chans:
         return await show(ev, NO_CHANNELS, kb([[("➕ Add Channel", "addch")], [("⬅️ Back", "menu")]]))
-    rows = [[(f"📺 {c['title']}", f"rp_ch:{c['chat_id']}")] for c in chans]
+    rows = [[(c["title"], f"rp_ch:{c['chat_id']}")] for c in chans]
     rows.append([("⬅️ Back", "menu")])
-    await show(ev, "🔁 <b>Repeat Post</b>\n\nSelect the channel to post in:", kb(rows))
+    await show(ev, "🔁 <b>Repeat Post !!</b>\n\nSelect The Channel To Post In:", kb(rows))
 
 
 @router.callback_query(F.data == "rep")
