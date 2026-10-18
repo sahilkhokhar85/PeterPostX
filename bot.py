@@ -301,7 +301,7 @@ def menu_text(user):
     name = esc(user.first_name or "there")
     return (
         f'Hey <a href="tg://user?id={user.id}">{name}</a> !! 💌\n\n'
-        "💫 Welcome To The Post Scheduler Bot! ❤️✨\n\n"
+        "Welcome To The Post Scheduler Bot! ❤️✨\n\n"
         "Schedule Posts To Your Channels, Set Auto-Delete Timers And Manage Everything From One Place.\n\n"
         "⏰ Timed · 🗑 Auto-Delete · ✏️ Editable\n\n"
         "👇 Choose An Option Below."
