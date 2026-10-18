@@ -4,7 +4,7 @@ Schedule posts to your Telegram channels, with auto-delete timers, link preview 
 and a full manager for scheduled posts.
 
 ## Features
-- Pick the channel from buttons, then send any message (text, photo, video, document, GIF, audio, voice, sticker)
+- Pick the channel from buttons, then send any message (text, photo, video, document, GIF, audio, voice, sticker, album)
 - Schedule with a time (`18:30`, `6:30pm`, `25-12-2026 18:30`) or a delay (`30m`, `2h`, `1d 6h`), or post now
 - Auto-delete timer (presets or custom)
 - Link preview ON/OFF, asked every time a post contains a link
@@ -41,7 +41,7 @@ and a full manager for scheduled posts.
 - If the bot was offline at a scheduled time, the post is published as soon as it is back online.
 - A repeat run that is more than 1 hour late (bot was offline) is skipped, so old posts are not sent in a burst.
 - Telegram may refuse to delete very old messages (around 48 hours); the bot will notify you if that happens.
-- Albums (multiple photos in one message) are not supported.
+- Albums (2-10 photos/videos, or documents, or audio files) are supported. Send the whole album at once; its caption is used as the post caption.
 
 ## Run locally
 ```
