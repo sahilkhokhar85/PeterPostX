@@ -13,12 +13,17 @@ and a full manager for scheduled posts.
 - Silent (no notification) option
 - Failed posts are kept so you can retry or edit them
 - Edit already-published posts (text/caption) from Scheduled > channel > Published Posts
-- Commands: /start /new /scheduled /channels /cancel /id
+- **Repeat posts**: pick weekdays (Mon-Sun, or Every day / Weekdays / Weekend), one or more times per day,
+  an end rule (never / after N posts / on a date picked from a calendar), auto-delete, and "Replace previous"
+  (the old post is deleted when the new one goes out). Pause, resume, skip next, edit message/days/times, send now.
+- Status message when a post goes out: "Posting... Please wait", then "Posted to <channel>"
+- All bot messages are bold; monospace parts stay monospace
+- Commands: /start /new /repeat /scheduled /channels /cancel /id
 - Owner-only access
 
 ## Setup
 1. Create a bot with @BotFather and copy the token.
-2. Push this folder to a GitHub repo.
+2. Push this folder to a GitHub repo (bot.py, db.py, helpers.py, requirements.txt, Procfile).
 3. On Railway: New Project > Deploy from GitHub repo.
 4. Create a MongoDB database (MongoDB Atlas free tier, or the Railway MongoDB plugin) and copy the connection string.
 5. Set variables:
@@ -34,6 +39,7 @@ and a full manager for scheduled posts.
 ## Notes
 - All data is stored in MongoDB, so redeploys do not lose scheduled posts.
 - If the bot was offline at a scheduled time, the post is published as soon as it is back online.
+- A repeat run that is more than 1 hour late (bot was offline) is skipped, so old posts are not sent in a burst.
 - Telegram may refuse to delete very old messages (around 48 hours); the bot will notify you if that happens.
 - Albums (multiple photos in one message) are not supported.
 
