@@ -662,9 +662,36 @@ async def cb_new(cb: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("np_ch:"))
 async def np_channel(cb: CallbackQuery, state: FSMContext):
-    await state.set_data({"chat_id": int(cb.data.split(":")[1]), "silent": 0, "preview": 0})
+    await state.set_data(
+        {"chat_id": int(cb.data.split(":")[1]), "silent": 0, "preview": 0, "items": [], "ctrl_id": None}
+    )
     await state.set_state(NewPost.content)
     await show(cb, CONTENT_PROMPT, kb([[("⬅️ Back", "new")]]))
+
+
+USER_LOCKS = {}
+
+
+def user_lock(uid):
+    return USER_LOCKS.setdefault(uid, asyncio.Lock())
+
+
+async def np_ctrl(target, state):
+    """(Re)send the '<n> messages added' message at the bottom of the chat, with Done / Undo."""
+    d = await state.get_data()
+    n = len(d.get("items", []))
+    old = d.get("ctrl_id")
+    if old:
+        try:
+            await target.bot.delete_message(target.chat.id, old)
+        except Exception:
+            pass
+    msg = await reply(
+        target,
+        f"📥 <b>{n} message{'s' if n != 1 else ''} added</b>\n\nSend more messages, or tap Done.",
+        kb([[("✅ Done", "np_done"), ("↩️ Undo Last", "np_undo")], [("❌ Cancel", "menu")]]),
+    )
+    await state.update_data(ctrl_id=msg.message_id)
 
 
 @router.message(NewPost.content)
@@ -673,20 +700,57 @@ async def np_content(m: Message, state: FSMContext):
     if c is SKIP:
         return
     if not c:
-        return await reply(m, 
+        return await reply(
+            m,
             "This message type is not supported. Send text, photo, video, document, GIF, "
-            "audio, voice or sticker."
+            "audio, voice or sticker.",
         )
-    await state.update_data(content=c)
-    if has_link(c):
+    async with user_lock(m.from_user.id):
+        d = await state.get_data()
+        items = list(d.get("items", []))
+        items.append({"mid": m.message_id, "c": c})
+        items.sort(key=lambda x: x["mid"])
+        await state.update_data(items=items)
+        await np_ctrl(m, state)
+
+
+@router.callback_query(NewPost.content, F.data == "np_undo")
+async def np_undo(cb: CallbackQuery, state: FSMContext):
+    async with user_lock(cb.from_user.id):
+        d = await state.get_data()
+        items = sorted(d.get("items", []), key=lambda x: x["mid"])
+        if items:
+            items.pop()
+        await state.update_data(items=items)
+        await safe_answer(cb, "Removed the last message.")
+        if not items:
+            await state.update_data(ctrl_id=None)
+            return await show(cb, CONTENT_PROMPT, kb([[("⬅️ Back", "new")]]))
+        await np_ctrl(cb.message, state)
+
+
+@router.callback_query(NewPost.content, F.data == "np_done")
+async def np_done(cb: CallbackQuery, state: FSMContext):
+    async with user_lock(cb.from_user.id):
+        d = await state.get_data()
+        items = sorted(d.get("items", []), key=lambda x: x["mid"])
+        if not items:
+            return await safe_answer(cb, "Send at least one message first.", True)
+        contents = [i["c"] for i in items]
+        await state.update_data(contents=contents)
+    if any(has_link(c) for c in contents):
         await state.set_state(NewPost.preview)
-        return await reply(m, 
-            "🔗 This post contains a link.\nDo you want to show the link preview?",
-            reply_markup=kb(
-                [[("✅ Preview ON", "np_pre:1"), ("🚫 Preview OFF", "np_pre:0")], [("❌ Cancel", "menu")]]
-            ),
+        text = (
+            "🔗 This post contains a link.\nDo you want to show the link preview?"
+            if len(contents) == 1
+            else "🔗 Some messages contain links.\nDo you want to show the link previews?"
         )
-    await ask_when(m, state)
+        return await show(
+            cb,
+            text,
+            kb([[("✅ Preview ON", "np_pre:1"), ("🚫 Preview OFF", "np_pre:0")], [("❌ Cancel", "menu")]]),
+        )
+    await ask_when(cb, state)
 
 
 @router.callback_query(NewPost.preview, F.data.startswith("np_pre:"))
@@ -696,12 +760,12 @@ async def np_preview(cb: CallbackQuery, state: FSMContext):
 
 
 async def ask_when(ev, state):
+    d = await state.get_data()
     await state.set_state(NewPost.when)
-    await show(
-        ev,
-        when_text(),
-        kb([[("⚡ Send Now", "np_now"), ("🔁 Repeat", "np_rep")], [("❌ Cancel", "menu")]]),
-    )
+    top = [("⚡ Send Now", "np_now")]
+    if len(d.get("contents", [])) <= 1:
+        top.append(("🔁 Repeat", "np_rep"))
+    await show(ev, when_text(), kb([top, [("❌ Cancel", "menu")]]))
 
 
 async def np_set_time(ev, state, dt):
@@ -749,9 +813,15 @@ async def ask_confirm(ev, state):
         await state.clear()
         return await show(ev, "That channel no longer exists.", kb([[("⬅️ Menu", "menu")]]))
     await state.set_state(NewPost.confirm)
-    c = d["content"]
-    L = ["<b>Review your post</b>", "", f"📺 Channel: {esc(ch['title'])}", f"📝 Content: {esc(plain(c, 120))}"]
-    if has_link(c):
+    contents = d["contents"]
+    if len(contents) == 1:
+        L = ["<b>Review your post</b>", "", f"📺 Channel: {esc(ch['title'])}", f"📝 Content: {esc(plain(contents[0], 120))}"]
+    else:
+        L = ["<b>Review your posts</b>", "", f"📺 Channel: {esc(ch['title'])}", f"📝 Messages: {len(contents)} (sent in this order)"]
+        L += [f"{i}. {esc(plain(c, 40))}" for i, c in enumerate(contents[:5], 1)]
+        if len(contents) > 5:
+            L.append(f"…and {len(contents) - 5} more")
+    if any(has_link(c) for c in contents):
         L.append("🔗 Link preview: " + ("ON" if d["preview"] else "OFF"))
     L.append("🕒 Posting: " + ("Immediately" if d["send_at"] <= time.time() + 5 else fmt_dt(d["send_at"])))
     da = d.get("delete_after")
@@ -775,20 +845,28 @@ async def np_silent(cb: CallbackQuery, state: FSMContext):
 @router.callback_query(NewPost.confirm, F.data == "np_ok")
 async def np_ok(cb: CallbackQuery, state: FSMContext):
     d = await state.get_data()
-    pid = await db.create_post(
-        owner_id=cb.from_user.id,
-        chat_id=d["chat_id"],
-        content=d["content"],
-        link_preview=d["preview"],
-        silent=d["silent"],
-        send_at=d["send_at"],
-        delete_after=d.get("delete_after"),
-    )
+    ids = []
+    for c in d["contents"]:
+        ids.append(
+            await db.create_post(
+                owner_id=cb.from_user.id,
+                chat_id=d["chat_id"],
+                content=c,
+                link_preview=d["preview"],
+                silent=d["silent"],
+                send_at=d["send_at"],
+                delete_after=d.get("delete_after"),
+            )
+        )
     await state.clear()
     when = "right now" if d["send_at"] <= time.time() + 5 else f"at {fmt_dt(d['send_at'])}"
+    if len(ids) == 1:
+        text = f"✅ Post <b>#{ids[0]}</b> scheduled. It will be published {when}."
+    else:
+        text = f"✅ <b>{len(ids)} posts</b> scheduled (#{ids[0]} to #{ids[-1]}). They will be published in order {when}."
     await show(
         cb,
-        f"✅ Post <b>#{pid}</b> scheduled. It will be published {when}.",
+        text,
         kb([[("📋 Scheduled", "sch"), ("➕ New Post", "new")], [("⬅️ Menu", "menu")]]),
     )
 
@@ -1371,8 +1449,10 @@ async def rp_channel(cb: CallbackQuery, state: FSMContext):
 @router.callback_query(NewPost.when, F.data == "np_rep")
 async def np_to_repeat(cb: CallbackQuery, state: FSMContext):
     d = await state.get_data()
+    if len(d.get("contents", [])) != 1:
+        return await safe_answer(cb, "Repeat works with a single message.", True)
     base = fresh_rule_data(d["chat_id"])
-    base.update({"content": d["content"], "preview": d.get("preview", 0), "silent": d.get("silent", 0)})
+    base.update({"content": d["contents"][0], "preview": d.get("preview", 0), "silent": d.get("silent", 0)})
     await state.set_data(base)
     await rep_ask_days(cb, state)
 
