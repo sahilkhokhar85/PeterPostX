@@ -99,6 +99,7 @@ class DB:
         await self.db.posts.delete_many(
             {"chat_id": chat_id, "status": {"$in": ["scheduled", "failed"]}}
         )
+        await self.db.repeats.delete_many({"chat_id": chat_id})
 
     async def claim(self, pid):
         r = await self.db.posts.update_one(
@@ -130,7 +131,16 @@ class DB:
             sort=[("delete_at", 1)],
             projection={"delete_at": 1},
         )
-        vals = [v for v in (a and a.get("send_at"), b and b.get("delete_at")) if v]
+        c = await self.db.repeats.find_one(
+            {"status": "active", "paused": False, "next_run": {"$ne": None}},
+            sort=[("next_run", 1)],
+            projection={"next_run": 1},
+        )
+        vals = [
+            v
+            for v in (a and a.get("send_at"), b and b.get("delete_at"), c and c.get("next_run"))
+            if v
+        ]
         return min(vals) if vals else None
 
     async def counts_by_channel(self):
@@ -156,6 +166,16 @@ class DB:
         )
         return posts[offset : offset + limit]
 
+    async def stats(self):
+        return {
+            "channels": await self.db.channels.count_documents({}),
+            "scheduled": await self.db.posts.count_documents({"status": "scheduled"}),
+            "live_timers": await self.db.posts.count_documents(
+                {"status": "sent", "delete_at": {"$ne": None}}
+            ),
+            "failed": await self.db.posts.count_documents({"status": "failed"}),
+        }
+
     async def count_published(self, chat_id):
         return await self.db.posts.count_documents({"chat_id": chat_id, "status": "sent"})
 
@@ -167,6 +187,74 @@ class DB:
             .limit(limit)
             .to_list(None)
         )
+        return [_post(d) for d in docs]
+
+    # ---- repeats ----
+    async def create_repeat(self, **f):
+        d = await self.db.counters.find_one_and_update(
+            {"_id": "repeats"}, {"$inc": {"n": 1}}, upsert=True, return_document=True
+        )
+        rid = d["n"]
+        doc = {
+            "_id": rid,
+            "paused": False,
+            "status": "active",
+            "runs": 0,
+            "last_run": None,
+            "next_run": None,
+            "delete_after": None,
+            "replace_prev": 0,
+            "link_preview": 0,
+            "silent": 0,
+            "end_type": "never",
+            "end_count": None,
+            "end_date": None,
+        }
+        doc.update(f)
+        await self.db.repeats.insert_one(doc)
+        self.changed.set()
+        return rid
+
+    async def repeat(self, rid):
+        return _post(await self.db.repeats.find_one({"_id": rid}))
+
+    async def set_repeat(self, rid, **f):
+        await self.db.repeats.update_one({"_id": rid}, {"$set": f})
+        self.changed.set()
+
+    async def delete_repeat(self, rid):
+        await self.db.repeats.delete_one({"_id": rid})
+        self.changed.set()
+
+    async def due_repeats(self, now):
+        docs = await self.db.repeats.find(
+            {"status": "active", "paused": False, "next_run": {"$ne": None, "$lte": now}}
+        ).sort("next_run", 1).to_list(None)
+        return [_post(d) for d in docs]
+
+    async def count_repeats(self, chat_id=0):
+        return await self.db.repeats.count_documents({"chat_id": chat_id} if chat_id else {})
+
+    async def repeats(self, limit, offset, chat_id=0):
+        docs = (
+            await self.db.repeats.find({"chat_id": chat_id} if chat_id else {})
+            .sort("_id", 1)
+            .skip(offset)
+            .limit(limit)
+            .to_list(None)
+        )
+        titles = {c["chat_id"]: c["title"] for c in await self.channels()}
+        out = []
+        for d in docs:
+            r = _post(d)
+            r["ch_title"] = titles.get(r["chat_id"])
+            out.append(r)
+        return out
+
+    async def live_of_repeat(self, repeat_id, exclude_id):
+        docs = await self.db.posts.find(
+            {"repeat_id": repeat_id, "status": "sent", "_id": {"$ne": exclude_id}}
+        ).to_list(None)
         return [_post(d) for d in docs]
 
 
