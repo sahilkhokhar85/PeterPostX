@@ -1,53 +1,130 @@
-# Telegram Channel Post Scheduler Bot
+<p align="center">
+  <img src="https://files.catbox.moe/kazvi3.jpg" width="100%" alt="PeterPostX">
+</p>
 
-Schedule posts to your Telegram channels, with auto-delete timers, link preview control,
-and a full manager for scheduled posts.
+# 🗓 Telegram Post Scheduler Bot
 
-## Features
-- Pick the channel from buttons, then send any message (text, photo, video, document, GIF, audio, voice, sticker, album)
-- Send as many messages as you want for one go, then tap Done (Undo Last removes the last one). Each message becomes its own post and they are published in the order you sent them
-- Schedule with a time (`18:30`, `6:30pm`, `25-12-2026 18:30`) or a delay (`30m`, `2h`, `1d 6h`), or post now
-- Auto-delete timer (presets or custom)
-- Link preview ON/OFF, asked every time a post contains a link
-- Scheduled Posts manager: edit content, change time, change auto-delete, toggle link preview / silent,
-  preview, post now, delete. Live posts with a pending delete timer are listed too.
-- Silent (no notification) option
-- Failed posts are kept so you can retry or edit them
-- Edit already-published posts (text/caption) from Scheduled > channel > Published Posts
-- **Repeat posts**: pick weekdays (Mon-Sun, or Every day / Weekdays / Weekend), one or more times per day,
-  an end rule (never / after N posts / on a date picked from a calendar), auto-delete, and "Replace previous"
-  (the old post is deleted when the new one goes out). Pause, resume, skip next, edit message/days/times, send now.
-- Status message when a post goes out: "Posting... Please wait", then "Posted to <channel>"
-- Every screen has a Back button; after Send Now the auto-delete question shows an image (DELETE_IMAGE variable)
-- All bot messages are bold; monospace parts stay monospace
-- Commands: /start /new /repeat /scheduled /channels /cancel /id
-- Owner-only access
+<p align="center">
+  <img src="https://readme-typing-svg.herokuapp.com/?lines=Welcome+To+The+Post+Scheduler+Bot;Schedule+Posts+With+Timers;Repeat+%7C+Auto-Delete+%7C+Edit+%7C+Albums;Thank+You!&center=true&width=560" alt="Typing SVG">
+</p>
 
-## Setup
-1. Create a bot with @BotFather and copy the token.
-2. Push this folder to a GitHub repo (bot.py, db.py, helpers.py, requirements.txt, Procfile).
-3. On Railway: New Project > Deploy from GitHub repo.
-4. Create a MongoDB database (MongoDB Atlas free tier, or the Railway MongoDB plugin) and copy the connection string.
-5. Set variables:
-   - `BOT_TOKEN`
-   - `MONGODB_URI` (connection string)
-   - `OWNER_IDS` (your Telegram ID; leave empty on first run, send `/id` to the bot, then set it and redeploy)
-   - `TIMEZONE` (default `Asia/Kolkata`)
-   - `MONGODB_DB` (optional, default `peterpostx`)
-6. Start command: `python bot.py` (the Procfile already has it). Deploy.
-7. Add the bot as **admin** of your channel with "Post messages" and "Delete messages" permissions.
-   The channel is detected automatically. Or use My Channels > Add Channel.
+---
 
-## Notes
-- All data is stored in MongoDB, so redeploys do not lose scheduled posts.
-- If the bot was offline at a scheduled time, the post is published as soon as it is back online.
-- A repeat run that is more than 1 hour late (bot was offline) is skipped, so old posts are not sent in a burst.
-- Telegram may refuse to delete very old messages (around 48 hours); the bot will notify you if that happens.
-- Albums (2-10 photos/videos, or documents, or audio files) are supported. Send the whole album at once; its caption is used as the post caption.
+## ✨ What This Bot Can Do
 
-## Run locally
+<details>
+<summary><b>👉 Tap to open the feature list</b></summary>
+
+|    | Feature                                                                                                               |
+| --- | --------------------------------------------------------------------------------------------------------------------- |
+| 📺  | Many channels: add one by making the bot an admin (detected automatically), or forward a message / send its ID        |
+| 📝  | New Post: send as many messages as you want, tap **Done**. Each message becomes its own post, sent in order           |
+| 🖼  | All message types: text, photo, video, document, GIF, audio, voice, sticker and albums                                |
+| ⏰  | Schedule by time, exact date or delay (`18:30`, `25-12-2026 18:30`, `2h`), or **Send Now**                             |
+| 🗑  | Auto-delete timer for every post (presets or a custom time)                                                           |
+| 🔁  | Repeat posts: pick Mon to Sun (or Every day / Weekdays / Weekend), one or more times a day, stop never / after N / on a date |
+| ⏸  | Pause, resume, skip next, edit messages, days and times of a repeat                                                   |
+| ♻️ | Replace previous: the new post goes out, then the old one is deleted, so the channel always shows the latest          |
+| 🔗  | Link preview ON / OFF, asked for every post that has a link                                                           |
+| 📋  | Manage scheduled posts: edit, change time, change auto-delete, preview, send now or delete                            |
+| ✏️ | Edit already published posts (text or caption) and change link preview from the bot                                   |
+| 🔕  | Silent posts (no notification)                                                                                        |
+| ⏳  | Live status: `Posting… Please wait`, then `Posted`. Failed posts can be retried with one tap                          |
+| ⬅️ | Back button on every screen                                                                                           |
+| 🔒  | Private bot: only the owners can use it                                                                               |
+| 🗄  | MongoDB storage: scheduled posts and repeats are safe across restarts and redeploys                                   |
+
+</details>
+
+## 🔧 Environment Variables
+
+> ⚠️ `BOT_TOKEN` and `MONGODB_URI` have no default value. Set them in your host's variables and never commit them.
+
+<details>
+<summary><b>👉 Tap to open the variable list</b></summary>
+
+| Variable       | Meaning                                                                                      |
+| -------------- | -------------------------------------------------------------------------------------------- |
+| `BOT_TOKEN`    | From [BotFather](https://t.me/BotFather)                                                     |
+| `OWNER_IDS`    | Owner Telegram ids, separated by commas. Send `/id` to the bot to find yours                 |
+| `MONGODB_URI`  | MongoDB connection URL (`MONGO_URL` also works)                                              |
+| `MONGODB_DB`   | MongoDB database name (optional, default `peterpostx`)                                       |
+| `TIMEZONE`     | Your time zone (optional, default `Asia/Kolkata`)                                            |
+| `START_IMAGE`  | Picture shown with the start message (optional)                                              |
+| `DELETE_IMAGE` | Picture shown on the auto-delete question after **Send Now** (optional)                      |
+
+</details>
+
+## 🚀 Deploy On Railway
+
+1. Push this repo to GitHub, then on Railway choose **New Project → Deploy from GitHub repo**.
+2. Open **Variables** and add `BOT_TOKEN`, `MONGODB_URI` and `OWNER_IDS`.
+3. Using MongoDB Atlas? In **Network Access** allow access from anywhere (`0.0.0.0/0`), or Railway cannot connect.
+4. Deploy. When the logs say `Bot started`, send `/start` to your bot.
+5. Make the bot an **admin** of your channel with permission to **Post, Edit and Delete** messages.
+
+The start command is already set in `Procfile` (`python bot.py`).
+
+## 🧭 How To Use
+
+```text
+➕ New Post   → pick channel → send messages → Done → time → auto-delete → confirm
+🔁 Repeat     → pick channel → send messages → Done → days → times → end → auto-delete → confirm
+🗓 Scheduled  → pick channel → open a post or a repeat → edit, pause, resume or delete
+📢 My Channels → open a channel → New Post / Scheduled / Remove
 ```
-pip install -r requirements.txt
-export BOT_TOKEN=... OWNER_IDS=... 
-python bot.py
+
+## 🤖 Commands
+
+<details>
+<summary><b>👉 Tap to open the command list</b></summary>
+
+| Command      | What it does                                         |
+| ------------ | ---------------------------------------------------- |
+| `/start`     | Open the main menu                                   |
+| `/new`       | Create a new post                                    |
+| `/repeat`    | Create a daily or weekly repeating post              |
+| `/scheduled` | Manage scheduled and published posts                 |
+| `/channels`  | Manage your channels                                 |
+| `/cancel`    | Cancel the current action                            |
+| `/id`        | Show your Telegram ID (works for everyone)           |
+
+</details>
+
+## 📝 Good To Know
+
+<details>
+<summary><b>👉 Tap to open the notes</b></summary>
+
+- If the bot was offline at a scheduled time, the post goes out as soon as it is back online.
+- A repeat run that is more than 1 hour late is skipped, so old posts are never sent in a burst.
+- Albums can have 2 to 10 photos or videos, or only documents, or only audio files (Telegram rule). Its caption is used as the post caption.
+- Telegram may refuse to delete very old messages (around 48 hours). The bot tells you if that happens.
+- Published posts can only have their text or caption edited. The media itself cannot be changed.
+
+</details>
+
+## 📁 Files Guide
+
+```text
+bot.py            all bot screens, the scheduler and repeat logic
+db.py             MongoDB (channels, posts, repeats)
+helpers.py        time, days and formatting helpers
+requirements.txt  Python packages
+Procfile          start command
 ```
+
+## 💝 Credits
+
+<details>
+<summary><b>👉 Tap to see the credits</b></summary>
+
+- 🗓 Built, customised and maintained for the **ChillFlizX** community
+- 🧩 Made with [aiogram](https://github.com/aiogram/aiogram) and MongoDB
+- ❤️ Thank you to everyone who tested and gave feedback
+
+</details>
+
+---
+
+© ChillFlizX. All rights reserved.
