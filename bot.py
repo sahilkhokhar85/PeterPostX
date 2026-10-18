@@ -526,11 +526,9 @@ async def cb_add_channel(cb: CallbackQuery, state: FSMContext):
     await state.set_state(AddChannel.waiting)
     await show(
         cb,
-        "➕ <b>Add a channel</b>\n\n"
-        "1. Add this bot as an <b>admin</b> of your channel with permission to "
-        "<b>Post</b>, <b>Edit</b> and <b>Delete</b> messages. It will be detected automatically.\n\n"
-        "2. Or, to add it manually, forward any message from the channel here, or send the "
-        "channel @username / numeric ID.",
+        "➕ <b>Add Channel</b>\n\n"
+        "1. Make this bot an admin of your channel (Post, Edit, Delete). It is added automatically.\n\n"
+        "2. Or forward any message from the channel here, or send its @username or ID.",
         kb([[("⬅️ Back", "chs")]]),
     )
 
