@@ -7,7 +7,7 @@ import time
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
@@ -79,6 +79,57 @@ async def safe_answer(cb, text=None, alert=False):
         pass
 
 
+# ---- messages of the running flow are remembered, so Cancel can delete them again
+TRASH = {}
+FLOW_PREFIXES = ("NewPost:", "RepeatNew:", "RepeatEdit:")
+
+
+def trash_add(chat_id, *mids):
+    s = TRASH.setdefault(chat_id, set())
+    for mid in mids:
+        if mid:
+            s.add(mid)
+
+
+def trash_forget(chat_id):
+    TRASH.pop(chat_id, None)
+
+
+async def safe_delete(bot, chat_id, ids):
+    ids = sorted({i for i in ids if i})
+    for i in range(0, len(ids), 100):
+        chunk = ids[i : i + 100]
+        try:
+            await bot.delete_messages(chat_id=chat_id, message_ids=chunk)
+        except Exception:
+            for mid in chunk:
+                try:
+                    await bot.delete_message(chat_id, mid)
+                except Exception:
+                    pass
+
+
+async def trash_clear(bot, chat_id):
+    await safe_delete(bot, chat_id, TRASH.pop(chat_id, set()))
+
+
+class TrackUserMessages(BaseMiddleware):
+    """While a flow (New Post / Repeat) is running, remember every message the user sends."""
+
+    async def __call__(self, handler, event, data):
+        try:
+            state = data.get("state")
+            st = await state.get_state() if state else None
+            if st and st.startswith(FLOW_PREFIXES):
+                trash_add(event.chat.id, event.message_id)
+        except Exception:
+            pass
+        return await handler(event, data)
+
+
+router.message.outer_middleware(TrackUserMessages())
+
+
 async def show(ev, text, markup=None):
     """Edit the current bot message (callback) or send a new one (message)."""
     text = bold(text)
@@ -90,33 +141,46 @@ async def show(ev, text, markup=None):
                 await msg.delete()
             except Exception:
                 pass
-            await msg.answer(text, reply_markup=markup, link_preview_options=NOPREV)
+            m2 = await msg.answer(text, reply_markup=markup, link_preview_options=NOPREV)
+            trash_add(m2.chat.id, m2.message_id)
             return
         try:
             await msg.edit_text(text, reply_markup=markup, link_preview_options=NOPREV)
+            trash_add(msg.chat.id, msg.message_id)
             return
         except TelegramBadRequest as e:
             if "not modified" in str(e):
                 return
-        await msg.answer(text, reply_markup=markup, link_preview_options=NOPREV)
+        m2 = await msg.answer(text, reply_markup=markup, link_preview_options=NOPREV)
+        trash_add(m2.chat.id, m2.message_id)
     else:
-        await ev.answer(text, reply_markup=markup, link_preview_options=NOPREV)
+        m2 = await ev.answer(text, reply_markup=markup, link_preview_options=NOPREV)
+        trash_add(m2.chat.id, m2.message_id)
 
 
 async def show_photo(ev, url, caption, markup=None):
-    """Replace the current screen with a photo + caption (falls back to plain text)."""
+    """Show a screen as photo + caption (edits the caption if the screen is already a photo)."""
     caption = bold(caption)
     msg = ev.message
     await safe_answer(ev)
+    if getattr(msg, "photo", None):
+        try:
+            await msg.edit_caption(caption=caption, reply_markup=markup)
+            trash_add(msg.chat.id, msg.message_id)
+            return
+        except TelegramBadRequest as e:
+            if "not modified" in str(e):
+                return
     try:
         await msg.delete()
     except Exception:
         pass
     try:
-        await msg.answer_photo(photo=url, caption=caption, reply_markup=markup)
+        m2 = await msg.answer_photo(photo=url, caption=caption, reply_markup=markup)
     except Exception:
         log.warning("Could not send screen image, falling back to text")
-        await msg.answer(caption, reply_markup=markup, link_preview_options=NOPREV)
+        m2 = await msg.answer(caption, reply_markup=markup, link_preview_options=NOPREV)
+    trash_add(m2.chat.id, m2.message_id)
 
 
 async def notify(bot, uid, text, markup=None):
@@ -128,7 +192,9 @@ async def notify(bot, uid, text, markup=None):
 
 async def reply(target, text, reply_markup=None):
     """Send a new message (bold, monospace kept)."""
-    return await target.answer(bold(text), reply_markup=reply_markup, link_preview_options=NOPREV)
+    m2 = await target.answer(bold(text), reply_markup=reply_markup, link_preview_options=NOPREV)
+    trash_add(m2.chat.id, m2.message_id)
+    return m2
 
 
 async def safe_send(bot, uid, text, markup=None):
@@ -268,9 +334,10 @@ async def gather_album(m):
     if any(i is None for i in items):
         return None
     caption = next((x.html_text for x in msgs if x.caption), None)
+    mids = [x.message_id for x in msgs]
     if len(items) == 1:
-        return {**items[0], "text": caption}
-    return {"type": "album", "items": items, "text": caption}
+        return {**items[0], "text": caption, "_mids": mids}
+    return {"type": "album", "items": items, "text": caption, "_mids": mids}
 
 
 async def get_content(m):
@@ -279,7 +346,7 @@ async def get_content(m):
     return extract(m)
 
 
-async def send_content(bot: Bot, chat_id, c, preview, silent):
+async def send_content(bot: Bot, chat_id, c, preview, silent, markup=None):
     kw = {"chat_id": chat_id, "disable_notification": bool(silent)}
     t = c["type"]
     if t == "album":
@@ -288,6 +355,8 @@ async def send_content(bot: Bot, chat_id, c, preview, silent):
             for i, it in enumerate(c["items"])
         ]
         return await bot.send_media_group(media=media, **kw)  # returns a list of messages
+    if markup is not None:
+        kw["reply_markup"] = markup
     if t == "text":
         return await bot.send_message(
             text=c["text"], link_preview_options=LinkPreviewOptions(is_disabled=not preview), **kw
@@ -331,6 +400,7 @@ async def live_edit(bot: Bot, p):
 
 # ----------------------------------------------------------------- states
 class NewPost(StatesGroup):
+    channels = State()
     content = State()
     preview = State()
     when = State()
@@ -350,6 +420,7 @@ class AddChannel(StatesGroup):
 
 
 class RepeatNew(StatesGroup):
+    channels = State()
     content = State()
     preview = State()
     days = State()
@@ -470,16 +541,27 @@ async def show_menu(ev):
         await target.answer(text, reply_markup=MENU)
 
 
+async def abort_flow(ev, state):
+    """Cancel the running flow and delete every message that belongs to it."""
+    msg = ev if isinstance(ev, Message) else ev.message
+    cur = await state.get_state()
+    if cur and cur.startswith(FLOW_PREFIXES):
+        await trash_clear(msg.bot, msg.chat.id)
+    else:
+        trash_forget(msg.chat.id)
+    await state.clear()
+
+
 @router.message(CommandStart())
 @router.message(Command("cancel"))
 async def cmd_start(m: Message, state: FSMContext):
-    await state.clear()
+    await abort_flow(m, state)
     await show_menu(m)
 
 
 @router.callback_query(F.data == "menu")
 async def cb_menu(cb: CallbackQuery, state: FSMContext):
-    await state.clear()
+    await abort_flow(cb, state)
     await show_menu(cb)
 
 
@@ -659,16 +741,51 @@ async def on_channel_member(ev: ChatMemberUpdated, bot: Bot):
 
 
 # ----------------------------------------------------------------- new post flow
+async def channel_pick_screen(ev, state, head, prefix):
+    d = await state.get_data()
+    sel = d.get("sel", [])
+    chans = await db.channels()
+    rows = [[(("✅ " if c["chat_id"] in sel else "") + c["title"], f"{prefix}:t:{c['chat_id']}")] for c in chans]
+    rows.append([("☑️ Unselect All" if chans and len(sel) == len(chans) else "☑️ Select All", f"{prefix}:all")])
+    rows.append([("⬅️ Back", "menu"), ("➡️ Next", f"{prefix}:go")])
+    text = f"{head}\n\nSelect The Channels To Post In:"
+    if sel:
+        text += f"\n\nSelected: {len(sel)}"
+    await show(ev, text, kb(rows))
+
+
+async def pick_channels(cb, state, prefix):
+    """Toggle / select-all buttons. Returns the chosen channel ids when Next is tapped, else None."""
+    parts = cb.data.split(":")
+    d = await state.get_data()
+    sel = list(d.get("sel", []))
+    if parts[1] == "t":
+        cid = int(parts[2])
+        sel = [x for x in sel if x != cid] if cid in sel else sel + [cid]
+    elif parts[1] == "all":
+        ids = [c["chat_id"] for c in await db.channels()]
+        sel = [] if len(sel) == len(ids) else ids
+    else:
+        if not sel:
+            await safe_answer(cb, "Select at least one channel.", True)
+            return None
+        return sel
+    await state.update_data(sel=sel)
+    return None
+
+
 async def new_chooser(ev, state):
+    msg = ev if isinstance(ev, Message) else ev.message
+    trash_forget(msg.chat.id)
     await state.clear()
     chans = await db.channels()
     if not chans:
         return await show(
             ev, NO_CHANNELS, kb([[("➕ Add Channel", "addch")], [("⬅️ Back", "menu")]])
         )
-    rows = [[(c["title"], f"np_ch:{c['chat_id']}")] for c in chans]
-    rows.append([("⬅️ Back", "menu")])
-    await show(ev, "➕ <b>New Post !!</b>\n\nSelect The Channel To Post In:", kb(rows))
+    await state.set_data({"sel": [], "silent": 0, "preview": 0})
+    await state.set_state(NewPost.channels)
+    await channel_pick_screen(ev, state, "➕ <b>New Post !!</b>", "npc")
 
 
 @router.callback_query(F.data == "new")
@@ -676,24 +793,50 @@ async def cb_new(cb: CallbackQuery, state: FSMContext):
     await new_chooser(cb, state)
 
 
-@router.callback_query(F.data.startswith("np_ch:"))
-async def np_channel(cb: CallbackQuery, state: FSMContext):
-    await state.set_data(
-        {
-            "chat_id": int(cb.data.split(":")[1]),
-            "silent": 0,
-            "preview": 0,
-            "items": [],
-            "ctrl_id": None,
-            "coll_back": "new",
-            "coll_prompt": PROMPT_MULTI,
-        }
+@router.callback_query(NewPost.channels, F.data.startswith("npc:"))
+async def np_pick_channels(cb: CallbackQuery, state: FSMContext):
+    chosen = await pick_channels(cb, state, "npc")
+    if chosen:
+        return await np_start_collect(cb, state)
+    await channel_pick_screen(cb, state, "➕ <b>New Post !!</b>", "npc")
+
+
+async def np_start_collect(ev, state):
+    d = await state.get_data()
+    sel = d["sel"]
+    await state.update_data(
+        chat_ids=sel,
+        chat_id=sel[0],
+        pfx="np",
+        coll_back="np_bk_ch",
+        coll_prompt=PROMPT_MULTI,
+        items=d.get("items", []),
+        ctrl_id=None,
+        phase="collect",
     )
     await state.set_state(NewPost.content)
-    await show(cb, PROMPT_MULTI, kb([[("⬅️ Back", "new")]]))
+    if d.get("items"):
+        await coll_edit(ev, state, "np")
+    else:
+        await show(ev, PROMPT_MULTI, kb([[("⬅️ Back", "np_bk_ch")]]))
 
 
-# ---- generic "send several messages, then tap Done" collector (New Post, Repeat, Repeat edit)
+@router.callback_query(F.data.startswith("np_ch:"))
+async def np_channel(cb: CallbackQuery, state: FSMContext):
+    trash_forget(cb.message.chat.id)
+    await state.clear()
+    await state.set_data({"sel": [int(cb.data.split(":")[1])], "silent": 0, "preview": 0, "items": []})
+    await np_start_collect(cb, state)
+
+
+@router.callback_query(NewPost.content, F.data == "np_bk_ch")
+async def np_back_channels(cb: CallbackQuery, state: FSMContext):
+    await coll_drop_previews(cb.bot, cb.message.chat.id, state, keep=cb.message.message_id)
+    await state.set_state(NewPost.channels)
+    await channel_pick_screen(cb, state, "➕ <b>New Post !!</b>", "npc")
+
+
+# ---- "send several messages, review the preview, then continue" (New Post, Repeat, Repeat edit)
 USER_LOCKS = {}
 
 
@@ -706,32 +849,53 @@ def coll_text(n):
 
 
 def coll_kb(pfx, back_cb):
+    return kb([[("✅ Done", f"{pfx}_done")], [("⬅️ Back", back_cb), ("❌ Cancel", "menu")]])
+
+
+def prev_text(n):
+    return (
+        f"👀 <b>{n} message{'s' if n != 1 else ''} ready</b>\n\n"
+        "Tap 🗑 Remove under any message you do not want, then tap Continue."
+    )
+
+
+def prev_kb(pfx, back_cb):
     return kb(
         [
-            [("✅ Done", f"{pfx}_done"), ("↩️ Undo Last", f"{pfx}_undo")],
+            [("➕ Add More", f"{pfx}_more"), ("✅ Continue", f"{pfx}_go")],
             [("⬅️ Back", back_cb), ("❌ Cancel", "menu")],
         ]
     )
 
 
 async def coll_send(target, state, pfx):
-    """Send a fresh 'N messages added' message at the bottom of the chat (the old one is removed)."""
+    """Send a fresh 'N messages added' message at the bottom (the old one is removed)."""
     d = await state.get_data()
-    old = d.get("ctrl_id")
-    if old:
-        try:
-            await target.bot.delete_message(target.chat.id, old)
-        except Exception:
-            pass
+    if d.get("ctrl_id"):
+        await safe_delete(target.bot, target.chat.id, [d["ctrl_id"]])
     msg = await reply(target, coll_text(len(d.get("items", []))), coll_kb(pfx, d["coll_back"]))
-    await state.update_data(ctrl_id=msg.message_id)
+    await state.update_data(ctrl_id=msg.message_id, phase="collect")
 
 
 async def coll_edit(cb, state, pfx):
-    """Turn the current screen back into the 'N messages added' screen."""
+    """Turn the current screen into the 'N messages added' screen."""
     d = await state.get_data()
     await show(cb, coll_text(len(d.get("items", []))), coll_kb(pfx, d["coll_back"]))
-    await state.update_data(ctrl_id=cb.message.message_id)
+    await state.update_data(ctrl_id=cb.message.message_id, phase="collect")
+
+
+async def coll_drop_previews(bot, chat_id, state, keep=None):
+    """Delete the preview messages (and the preview control message, unless it is `keep`)."""
+    d = await state.get_data()
+    items = list(d.get("items", []))
+    ids = []
+    for it in items:
+        ids += it.get("pv", [])
+        it["pv"] = []
+    if d.get("phase") == "preview" and d.get("ctrl_id") and d["ctrl_id"] != keep:
+        ids.append(d["ctrl_id"])
+    await safe_delete(bot, chat_id, ids)
+    await state.update_data(items=items, phase="collect", ctrl_id=None)
 
 
 async def coll_add(m, state, pfx):
@@ -744,50 +908,138 @@ async def coll_add(m, state, pfx):
             "This message type is not supported. Send text, photo, video, document, GIF, "
             "audio, voice or sticker.",
         )
+    mids = c.pop("_mids", None) or [m.message_id]
     async with user_lock(m.from_user.id):
         d = await state.get_data()
+        if d.get("phase") == "preview":
+            await coll_drop_previews(m.bot, m.chat.id, state)
+            d = await state.get_data()
         items = list(d.get("items", []))
-        items.append({"mid": m.message_id, "c": c})
+        items.append({"mid": min(mids), "c": c, "orig": mids, "pv": []})
         items.sort(key=lambda x: x["mid"])
         await state.update_data(items=items)
         await coll_send(m, state, pfx)
 
 
-async def coll_undo(cb, state, pfx):
+async def coll_preview(cb, state, pfx):
+    """Done: show every message as it will be posted, each with its own 🗑 Remove button."""
     async with user_lock(cb.from_user.id):
         d = await state.get_data()
         items = sorted(d.get("items", []), key=lambda x: x["mid"])
-        if items:
-            items.pop()
-        await state.update_data(items=items)
-        await safe_answer(cb, "Removed the last message.")
         if not items:
-            await state.update_data(ctrl_id=None)
-            return await show(cb, d["coll_prompt"], kb([[("⬅️ Back", d["coll_back"])]]))
-        await coll_send(cb.message, state, pfx)
+            return await safe_answer(cb, "Send at least one message first.", True)
+        await safe_answer(cb)
+        bot, chat_id = cb.bot, cb.message.chat.id
+        gone = [cb.message.message_id]
+        for it in items:
+            gone += it.get("orig", [])
+        await safe_delete(bot, chat_id, gone)  # the originals are replaced by the previews
+        new_ids = []
+        for it in items:
+            pv = []
+            mk = kb([[("🗑 Remove", f"pv_rm:{it['mid']}")]])
+            try:
+                if it["c"]["type"] == "album":
+                    res = await send_content(bot, chat_id, it["c"], False, True)
+                    pv += [x.message_id for x in res]
+                    note = await bot.send_message(chat_id, bold("⬆️ Album"), reply_markup=mk)
+                    pv.append(note.message_id)
+                else:
+                    res = await send_content(bot, chat_id, it["c"], False, True, markup=mk)
+                    pv.append(res.message_id)
+            except Exception as e:
+                log.warning("Preview failed: %s", e)
+                note = await bot.send_message(chat_id, bold(esc(plain(it["c"], 80))), reply_markup=mk)
+                pv.append(note.message_id)
+            it["pv"] = pv
+            new_ids += pv
+        ctrl = await bot.send_message(
+            chat_id, bold(prev_text(len(items))), reply_markup=prev_kb(pfx, d["coll_back"]), link_preview_options=NOPREV
+        )
+        trash_add(chat_id, *new_ids, ctrl.message_id)
+        await state.update_data(items=items, ctrl_id=ctrl.message_id, phase="preview")
 
 
-async def coll_take(cb, state):
-    """Done pressed: returns the messages in the order they were sent (None if nothing was sent)."""
+async def coll_more(cb, state, pfx):
+    await coll_drop_previews(cb.bot, cb.message.chat.id, state, keep=cb.message.message_id)
+    await coll_edit(cb, state, pfx)
+
+
+async def coll_go(cb, state):
+    """Continue: returns the messages in order (previews are removed from the chat)."""
     async with user_lock(cb.from_user.id):
         d = await state.get_data()
         items = sorted(d.get("items", []), key=lambda x: x["mid"])
         if not items:
             await safe_answer(cb, "Send at least one message first.", True)
             return None
+        ids = []
+        for it in items:
+            ids += it.get("pv", [])
+            it["pv"] = []
+        await safe_delete(cb.bot, cb.message.chat.id, ids)
         contents = [i["c"] for i in items]
-        await state.update_data(contents=contents)
+        await state.update_data(items=items, contents=contents, phase="done", ctrl_id=cb.message.message_id)
         return contents
 
 
+@router.callback_query(F.data.startswith("pv_rm:"))
+async def pv_remove(cb: CallbackQuery, state: FSMContext):
+    mid = int(cb.data.split(":")[1])
+    bot, chat_id = cb.bot, cb.message.chat.id
+    async with user_lock(cb.from_user.id):
+        d = await state.get_data()
+        items = list(d.get("items", []))
+        it = next((x for x in items if x["mid"] == mid), None)
+        if d.get("phase") != "preview" or it is None:
+            await safe_answer(cb, "This preview is no longer active.", True)
+            await safe_delete(bot, chat_id, [cb.message.message_id])
+            return
+        items.remove(it)
+        await safe_delete(bot, chat_id, it.get("pv", []))
+        await state.update_data(items=items)
+        await safe_answer(cb, "Removed.")
+        if not items:
+            await safe_delete(bot, chat_id, [d.get("ctrl_id")])
+            m2 = await reply(cb.message, d["coll_prompt"], kb([[("⬅️ Back", d["coll_back"])]]))
+            await state.update_data(phase="collect", ctrl_id=m2.message_id)
+            return
+        try:
+            await bot.edit_message_text(
+                text=bold(prev_text(len(items))),
+                chat_id=chat_id,
+                message_id=d["ctrl_id"],
+                reply_markup=prev_kb(d.get("pfx", "np"), d["coll_back"]),
+            )
+        except Exception:
+            pass
+
+
+# ---- New Post: messages
 @router.message(NewPost.content)
 async def np_content(m: Message, state: FSMContext):
     await coll_add(m, state, "np")
 
 
-@router.callback_query(NewPost.content, F.data == "np_undo")
-async def np_undo(cb: CallbackQuery, state: FSMContext):
-    await coll_undo(cb, state, "np")
+@router.callback_query(NewPost.content, F.data == "np_done")
+async def np_done(cb: CallbackQuery, state: FSMContext):
+    await coll_preview(cb, state, "np")
+
+
+@router.callback_query(NewPost.content, F.data == "np_more")
+async def np_more(cb: CallbackQuery, state: FSMContext):
+    await coll_more(cb, state, "np")
+
+
+@router.callback_query(NewPost.content, F.data == "np_go")
+async def np_go(cb: CallbackQuery, state: FSMContext):
+    contents = await coll_go(cb, state)
+    if not contents:
+        return
+    if any(has_link(c) for c in contents):
+        await np_ask_preview(cb, state)
+    else:
+        await ask_when(cb, state)
 
 
 async def np_ask_preview(ev, state):
@@ -810,17 +1062,6 @@ async def np_ask_preview(ev, state):
     )
 
 
-@router.callback_query(NewPost.content, F.data == "np_done")
-async def np_done(cb: CallbackQuery, state: FSMContext):
-    contents = await coll_take(cb, state)
-    if not contents:
-        return
-    if any(has_link(c) for c in contents):
-        await np_ask_preview(cb, state)
-    else:
-        await ask_when(cb, state)
-
-
 @router.callback_query(NewPost.preview, F.data == "np_bk_c")
 async def np_back_collect(cb: CallbackQuery, state: FSMContext):
     await state.set_state(NewPost.content)
@@ -833,6 +1074,7 @@ async def np_preview(cb: CallbackQuery, state: FSMContext):
     await ask_when(cb, state)
 
 
+# ---- New Post: time
 async def ask_when(ev, state):
     await state.set_state(NewPost.when)
     await show(
@@ -857,22 +1099,16 @@ async def np_back_when(cb: CallbackQuery, state: FSMContext):
         await coll_edit(cb, state, "np")
 
 
-async def np_ask_delete(ev, state):
-    d = await state.get_data()
-    await state.set_state(NewPost.delete)
-    rows = del_rows("np_del:") + [[("⬅️ Back", "np_bk_d"), ("❌ Cancel", "menu")]]
-    if d.get("send_now") and isinstance(ev, CallbackQuery):
-        await show_photo(ev, DELETE_IMAGE, del_text(), kb(rows))
-    else:
-        await show(ev, del_text(), kb(rows))
-
-
 async def np_set_time(ev, state, dt, send_now=False):
     ts = int(dt.timestamp())
     if ts < time.time() - 60:
         return await show(ev, "That time is in the past. Send a future time.")
-    await state.update_data(send_at=max(ts, int(time.time())), send_now=send_now)
-    await np_ask_delete(ev, state)
+    d = await state.get_data()
+    n = len(d["contents"])
+    await state.update_data(
+        send_at=max(ts, int(time.time())), send_now=send_now, delete_afters=[None] * n, pins=[0] * n
+    )
+    await np_ask_msg(ev, state, 0)
 
 
 @router.callback_query(NewPost.when, F.data == "np_now")
@@ -888,16 +1124,64 @@ async def np_when(m: Message, state: FSMContext):
     await np_set_time(m, state, dt)
 
 
+# ---- New Post: auto-delete + pin, one message at a time
+def msg_head(c, idx, n):
+    if n <= 1:
+        return ""
+    return f"<b>Message {idx + 1} of {n}</b>\n📝 {esc(plain(c, 50))}\n\n"
+
+
+def pin_btn(cb_data, on):
+    return ("📌 Pin: ON" if on else "📌 Pin: OFF", cb_data)
+
+
+async def np_ask_msg(ev, state, idx):
+    d = await state.get_data()
+    await state.update_data(idx=idx)
+    await state.set_state(NewPost.delete)
+    rows = del_rows("np_del:") + [
+        [pin_btn("np_pin", d["pins"][idx])],
+        [("⬅️ Back", "np_bk_d"), ("❌ Cancel", "menu")],
+    ]
+    text = msg_head(d["contents"][idx], idx, len(d["contents"])) + del_text()
+    if d.get("send_now") and isinstance(ev, CallbackQuery):
+        await show_photo(ev, DELETE_IMAGE, text, kb(rows))
+    else:
+        await show(ev, text, kb(rows))
+
+
+@router.callback_query(NewPost.delete, F.data == "np_pin")
+async def np_toggle_pin(cb: CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    pins, i = list(d["pins"]), d["idx"]
+    pins[i] = 0 if pins[i] else 1
+    await state.update_data(pins=pins)
+    await np_ask_msg(cb, state, i)
+
+
 @router.callback_query(NewPost.delete, F.data == "np_bk_d")
 async def np_back_delete(cb: CallbackQuery, state: FSMContext):
-    await ask_when(cb, state)
+    d = await state.get_data()
+    if d["idx"] > 0:
+        await np_ask_msg(cb, state, d["idx"] - 1)
+    else:
+        await ask_when(cb, state)
+
+
+async def np_set_delete(ev, state, sec):
+    d = await state.get_data()
+    das, i = list(d["delete_afters"]), d["idx"]
+    das[i] = sec or None
+    await state.update_data(delete_afters=das)
+    if i + 1 < len(d["contents"]):
+        await np_ask_msg(ev, state, i + 1)
+    else:
+        await ask_confirm(ev, state)
 
 
 @router.callback_query(NewPost.delete, F.data.startswith("np_del:"))
 async def np_del_cb(cb: CallbackQuery, state: FSMContext):
-    sec = int(cb.data.split(":")[1])
-    await state.update_data(delete_after=sec or None)
-    await ask_confirm(cb, state)
+    await np_set_delete(cb, state, int(cb.data.split(":")[1]))
 
 
 @router.message(NewPost.delete)
@@ -905,30 +1189,38 @@ async def np_del_msg(m: Message, state: FSMContext):
     sec = parse_duration(m.text or "")
     if not sec:
         return await reply(m, "Invalid duration. Examples: <code>45m</code>, <code>3h</code>, <code>2d 12h</code>")
-    await state.update_data(delete_after=sec)
-    await ask_confirm(m, state)
+    await np_set_delete(m, state, sec)
 
 
+# ---- New Post: review + create
 async def ask_confirm(ev, state):
     d = await state.get_data()
-    ch = await db.channel(d["chat_id"])
-    if not ch:
+    names = {c["chat_id"]: c["title"] for c in await db.channels()}
+    titles = [names[c] for c in d["chat_ids"] if c in names]
+    if not titles:
         await state.clear()
         return await show(ev, "That channel no longer exists.", kb([[("⬅️ Menu", "menu")]]))
     await state.set_state(NewPost.confirm)
-    contents = d["contents"]
+    contents, das, pins = d["contents"], d["delete_afters"], d["pins"]
+    ch_line = (
+        f"📺 Channel: {esc(titles[0])}"
+        if len(titles) == 1
+        else f"📺 Channels ({len(titles)}): {esc(', '.join(titles))}"
+    )
     if len(contents) == 1:
-        L = ["<b>Review your post</b>", "", f"📺 Channel: {esc(ch['title'])}", f"📝 Content: {esc(plain(contents[0], 120))}"]
+        L = ["<b>Review your post</b>", "", ch_line, f"📝 Content: {esc(plain(contents[0], 120))}"]
     else:
-        L = ["<b>Review your posts</b>", "", f"📺 Channel: {esc(ch['title'])}", f"📝 Messages: {len(contents)} (sent in this order)"]
-        L += [f"{i}. {esc(plain(c, 40))}" for i, c in enumerate(contents[:5], 1)]
+        L = ["<b>Review your posts</b>", "", ch_line, f"📝 Messages: {len(contents)} (sent in this order)"]
+        for i, c in enumerate(contents[:5]):
+            L.append(f"{i + 1}. {esc(plain(c, 40))} · 🗑 {da_short(das[i])}" + (" · 📌" if pins[i] else ""))
         if len(contents) > 5:
             L.append(f"…and {len(contents) - 5} more")
     if any(has_link(c) for c in contents):
         L.append("🔗 Link preview: " + ("ON" if d["preview"] else "OFF"))
     L.append("🕒 Posting: " + ("Immediately" if d["send_at"] <= time.time() + 5 else fmt_dt(d["send_at"])))
-    da = d.get("delete_after")
-    L.append("🗑 Auto-delete: " + (f"{fmt_dur(da)} after posting" if da else "Off"))
+    if len(contents) == 1:
+        L.append("🗑 Auto-delete: " + (f"{fmt_dur(das[0])} after posting" if das[0] else "Off"))
+        L.append("📌 Pin: " + ("ON" if pins[0] else "OFF"))
     L.append("🔔 Notification: " + ("Silent" if d["silent"] else "Normal"))
     sil = "🔕 Silent: ON" if d["silent"] else "🔔 Silent: OFF"
     await show(
@@ -940,7 +1232,8 @@ async def ask_confirm(ev, state):
 
 @router.callback_query(NewPost.confirm, F.data == "np_bk_cf")
 async def np_back_confirm(cb: CallbackQuery, state: FSMContext):
-    await np_ask_delete(cb, state)
+    d = await state.get_data()
+    await np_ask_msg(cb, state, len(d["contents"]) - 1)
 
 
 @router.callback_query(NewPost.confirm, F.data == "np_sil")
@@ -953,25 +1246,35 @@ async def np_silent(cb: CallbackQuery, state: FSMContext):
 @router.callback_query(NewPost.confirm, F.data == "np_ok")
 async def np_ok(cb: CallbackQuery, state: FSMContext):
     d = await state.get_data()
+    names = {c["chat_id"] for c in await db.channels()}
+    cids = [c for c in d["chat_ids"] if c in names]
     ids = []
-    for c in d["contents"]:
-        ids.append(
-            await db.create_post(
-                owner_id=cb.from_user.id,
-                chat_id=d["chat_id"],
-                content=c,
-                link_preview=d["preview"],
-                silent=d["silent"],
-                send_at=d["send_at"],
-                delete_after=d.get("delete_after"),
+    for cid in cids:
+        for i, c in enumerate(d["contents"]):
+            ids.append(
+                await db.create_post(
+                    owner_id=cb.from_user.id,
+                    chat_id=cid,
+                    content=c,
+                    link_preview=d["preview"],
+                    silent=d["silent"],
+                    send_at=d["send_at"],
+                    delete_after=d["delete_afters"][i],
+                    pin=d["pins"][i],
+                )
             )
-        )
+    trash_forget(cb.message.chat.id)
     await state.clear()
     when = "right now" if d["send_at"] <= time.time() + 5 else f"at {fmt_dt(d['send_at'])}"
     if len(ids) == 1:
         text = f"✅ Post <b>#{ids[0]}</b> scheduled. It will be published {when}."
-    else:
+    elif len(cids) == 1:
         text = f"✅ <b>{len(ids)} posts</b> scheduled (#{ids[0]} to #{ids[-1]}). They will be published in order {when}."
+    else:
+        text = (
+            f"✅ <b>{len(ids)} posts</b> scheduled in <b>{len(cids)} channels</b> "
+            f"(#{ids[0]} to #{ids[-1]}). They will be published {when}."
+        )
     await show(
         cb,
         text,
@@ -1073,7 +1376,7 @@ async def cb_published(cb: CallbackQuery, state: FSMContext):
     rows = []
     for p in await db.published(PAGE, page * PAGE, cid):
         when = datetime.fromtimestamp(p["sent_at"], TZ).strftime("%d %b %H:%M")
-        mark = " 🗑" if p["delete_at"] else ""
+        mark = (" 🗑" if p["delete_at"] else "") + (" 📌" if p.get("pinned") else "")
         rows.append([(f"✅ #{p['id']} · {when} · {plain(p['content'], 22)}{mark}", f"p:{p['id']}")])
     if pages > 1:
         rows.append(nav_row("pub", page, pages, cid))
@@ -1118,6 +1421,10 @@ async def show_post(ev, pid):
     if has_link(c):
         L.append("🔗 Link preview: " + ("ON" if p["link_preview"] else "OFF"))
     L.append("🔔 Notification: " + ("Silent" if p["silent"] else "Normal"))
+    if st in EDITABLE:
+        L.append("📌 Pin: " + ("ON" if p.get("pin") else "OFF"))
+    elif st == "sent":
+        L.append("📌 Pinned: " + ("Yes" if p.get("pinned") else "No"))
 
     back = ("⬅️ Back", back_cb(p))
     if st in EDITABLE:
@@ -1125,6 +1432,7 @@ async def show_post(ev, pid):
         if has_link(c):
             tog.append((f"🔗 Preview: {'ON' if p['link_preview'] else 'OFF'}", f"pt_pre:{pid}"))
         tog.append(("🔕 Silent: ON" if p["silent"] else "🔔 Silent: OFF", f"pt_sil:{pid}"))
+        tog.append(pin_btn(f"pt_pin:{pid}", p.get("pin")))
         rows = [
             [("✏️ Edit", f"pe_c:{pid}"), ("🕒 Time", f"pe_t:{pid}")],
             [("🗑 Auto-delete", f"pe_d:{pid}"), ("👁 View", f"pv:{pid}")],
@@ -1141,6 +1449,7 @@ async def show_post(ev, pid):
         rows = []
         if first:
             rows.append(first)
+        rows.append([("📍 Unpin" if p.get("pinned") else "📌 Pin Now", f"pp:{pid}")])
         rows.append([("🗑 Auto-delete", f"pe_d:{pid}"), ("👁 View", f"pv:{pid}")])
         rows.append([("🗑 Delete Now", f"pdn:{pid}"), back])
     else:
@@ -1197,6 +1506,35 @@ async def cb_toggle_silent(cb: CallbackQuery):
     if p:
         await db.set(pid, silent=0 if p["silent"] else 1)
         await show_post(cb, pid)
+
+
+@router.callback_query(F.data.startswith("pt_pin:"))
+async def cb_toggle_pin(cb: CallbackQuery):
+    pid = int(cb.data.split(":")[1])
+    p = await editable(cb, pid)
+    if p:
+        await db.set(pid, pin=0 if p.get("pin") else 1)
+        await show_post(cb, pid)
+
+
+@router.callback_query(F.data.startswith("pp:"))
+async def cb_pin_now(cb: CallbackQuery, bot: Bot):
+    """Pin / Unpin a post that is live in the channel."""
+    pid = int(cb.data.split(":")[1])
+    p = await db.post(pid)
+    if not p or p["status"] != "sent":
+        return await safe_answer(cb, "This post is not live.", True)
+    was = bool(p.get("pinned"))
+    try:
+        if was:
+            await bot.unpin_chat_message(chat_id=p["chat_id"], message_id=p["message_id"])
+        else:
+            await bot.pin_chat_message(chat_id=p["chat_id"], message_id=p["message_id"], disable_notification=True)
+        await db.set(pid, pinned=not was)
+        await safe_answer(cb, "Unpinned." if was else "Pinned.")
+    except Exception as e:
+        await safe_answer(cb, f"Could not {'unpin' if was else 'pin'}: {str(e)[:150]}", True)
+    await show_post(cb, pid)
 
 
 @router.callback_query(F.data.startswith("pn:"))
@@ -1456,24 +1794,43 @@ def rule_title(r, n=14):
     return plain(cs[0], n) + (f" (+{len(cs) - 1})" if len(cs) > 1 else "")
 
 
-def rule_lines(d, title):
+def rule_da(r, i):
+    das = r.get("delete_afters")
+    if das and i < len(das):
+        return das[i]
+    return r.get("delete_after")
+
+
+def rule_pin(r, i):
+    ps = r.get("pins")
+    return ps[i] if ps and i < len(ps) else 0
+
+
+def da_short(sec):
+    return fmt_dur(sec) if sec else "Off"
+
+
+def rule_lines(d, title, label="Channel"):
     cs = rule_contents(d)
-    da = d.get("delete_after")
-    L = [f"📺 Channel: {esc(title)}"]
+    L = [f"📺 {label}: {esc(title)}"]
     if len(cs) == 1:
         L.append(f"📝 Content: {esc(plain(cs[0], 120))}")
     else:
         L.append(f"📝 Messages: {len(cs)} (sent in this order)")
-        L += [f"{i}. {esc(plain(c, 40))}" for i, c in enumerate(cs[:3], 1)]
-        if len(cs) > 3:
-            L.append(f"…and {len(cs) - 3} more")
+        for i, c in enumerate(cs[:5]):
+            L.append(f"{i + 1}. {esc(plain(c, 40))} · 🗑 {da_short(rule_da(d, i))}" + (" · 📌" if rule_pin(d, i) else ""))
+        if len(cs) > 5:
+            L.append(f"…and {len(cs) - 5} more")
     L += [
         f"📅 Days: {days_label(d['days'])}",
         f"🕒 Times: {', '.join(t12(t) for t in d['times'])}",
         f"🏁 Ends: {end_label(d)}",
-        "🗑 Auto-delete: " + (f"{fmt_dur(da)} after posting" if da else "Off"),
-        "♻️ Replace previous: " + ("ON" if d.get("replace_prev") else "OFF"),
     ]
+    if len(cs) == 1:
+        da = rule_da(d, 0)
+        L.append("🗑 Auto-delete: " + (f"{fmt_dur(da)} after posting" if da else "Off"))
+        L.append("📌 Pin: " + ("ON" if rule_pin(d, 0) else "OFF"))
+    L.append("♻️ Replace previous: " + ("ON" if d.get("replace_prev") else "OFF"))
     if rule_has_link(d):
         L.append("🔗 Link preview: " + ("ON" if d.get("link_preview", d.get("preview", 0)) else "OFF"))
     L.append("🔔 Notification: " + ("Silent" if d.get("silent") else "Normal"))
@@ -1536,14 +1893,28 @@ def calendar_kb(year, month, back_cb):
 
 
 # ----------------------------------------------------------------- repeat: create flow
+def fresh_rule_fields():
+    return {
+        "days": [],
+        "times": [],
+        "end_type": "never",
+        "end_count": None,
+        "end_date": None,
+        "replace_prev": 0,
+        "origin": None,
+    }
+
+
 async def rep_chooser(ev, state):
+    msg = ev if isinstance(ev, Message) else ev.message
+    trash_forget(msg.chat.id)
     await state.clear()
     chans = await db.channels()
     if not chans:
         return await show(ev, NO_CHANNELS, kb([[("➕ Add Channel", "addch")], [("⬅️ Back", "menu")]]))
-    rows = [[(c["title"], f"rp_ch:{c['chat_id']}")] for c in chans]
-    rows.append([("⬅️ Back", "menu")])
-    await show(ev, "🔁 <b>Repeat Post !!</b>\n\nSelect The Channel To Post In:", kb(rows))
+    await state.set_data({"sel": [], "silent": 0, "preview": 0})
+    await state.set_state(RepeatNew.channels)
+    await channel_pick_screen(ev, state, "🔁 <b>Repeat Post !!</b>", "rpm")
 
 
 @router.callback_query(F.data == "rep")
@@ -1551,58 +1922,76 @@ async def cb_rep(cb: CallbackQuery, state: FSMContext):
     await rep_chooser(cb, state)
 
 
-def fresh_rule_data(chat_id):
-    return {
-        "chat_id": chat_id,
-        "silent": 0,
-        "preview": 0,
-        "days": [],
-        "times": [],
-        "end_type": "never",
-        "end_count": None,
-        "end_date": None,
-        "delete_after": None,
-        "replace_prev": 0,
-        "items": [],
-        "ctrl_id": None,
-        "coll_back": "rep",
-        "coll_prompt": REPEAT_PROMPT,
-    }
+@router.callback_query(RepeatNew.channels, F.data.startswith("rpm:"))
+async def rp_pick_channels(cb: CallbackQuery, state: FSMContext):
+    chosen = await pick_channels(cb, state, "rpm")
+    if chosen:
+        return await rp_start_collect(cb, state)
+    await channel_pick_screen(cb, state, "🔁 <b>Repeat Post !!</b>", "rpm")
 
 
-@router.callback_query(F.data.startswith("rp_ch:"))
-async def rp_channel(cb: CallbackQuery, state: FSMContext):
-    await state.set_data(fresh_rule_data(int(cb.data.split(":")[1])))
+async def rp_start_collect(ev, state):
+    d = await state.get_data()
+    sel = d["sel"]
+    await state.update_data(
+        chat_ids=sel,
+        chat_id=sel[0],
+        pfx="rp",
+        coll_back="rp_bk_ch",
+        coll_prompt=REPEAT_PROMPT,
+        items=d.get("items", []),
+        ctrl_id=None,
+        phase="collect",
+        **fresh_rule_fields(),
+    )
     await state.set_state(RepeatNew.content)
-    await show(cb, REPEAT_PROMPT, kb([[("⬅️ Back", "rep")]]))
+    if d.get("items"):
+        await coll_edit(ev, state, "rp")
+    else:
+        await show(ev, REPEAT_PROMPT, kb([[("⬅️ Back", "rp_bk_ch")]]))
+
+
+@router.callback_query(RepeatNew.content, F.data == "rp_bk_ch")
+async def rp_back_channels(cb: CallbackQuery, state: FSMContext):
+    await coll_drop_previews(cb.bot, cb.message.chat.id, state, keep=cb.message.message_id)
+    await state.set_state(RepeatNew.channels)
+    await channel_pick_screen(cb, state, "🔁 <b>Repeat Post !!</b>", "rpm")
 
 
 @router.callback_query(NewPost.when, F.data == "np_rep")
 async def np_to_repeat(cb: CallbackQuery, state: FSMContext):
-    d = await state.get_data()
-    contents = d["contents"]
-    base = fresh_rule_data(d["chat_id"])
-    base.update(
-        {
-            "contents": contents,
-            "content": contents[0],
-            "items": [{"mid": i, "c": c} for i, c in enumerate(contents)],
-            "preview": d.get("preview", 0),
-            "silent": d.get("silent", 0),
-        }
-    )
-    await state.set_data(base)
+    """Repeat button on the time screen: keep everything chosen so far, Back returns to the time screen."""
+    fields = fresh_rule_fields()
+    fields["origin"] = "np"
+    await state.update_data(**fields)
     await rep_ask_days(cb, state)
 
 
+# ---- messages
 @router.message(RepeatNew.content)
 async def rp_content(m: Message, state: FSMContext):
     await coll_add(m, state, "rp")
 
 
-@router.callback_query(RepeatNew.content, F.data == "rp_undo")
-async def rp_undo(cb: CallbackQuery, state: FSMContext):
-    await coll_undo(cb, state, "rp")
+@router.callback_query(RepeatNew.content, F.data == "rp_done")
+async def rp_done(cb: CallbackQuery, state: FSMContext):
+    await coll_preview(cb, state, "rp")
+
+
+@router.callback_query(RepeatNew.content, F.data == "rp_more")
+async def rp_more(cb: CallbackQuery, state: FSMContext):
+    await coll_more(cb, state, "rp")
+
+
+@router.callback_query(RepeatNew.content, F.data == "rp_go")
+async def rp_go(cb: CallbackQuery, state: FSMContext):
+    contents = await coll_go(cb, state)
+    if not contents:
+        return
+    if any(has_link(c) for c in contents):
+        await rp_ask_preview(cb, state)
+    else:
+        await rep_ask_days(cb, state)
 
 
 async def rp_ask_preview(ev, state):
@@ -1625,18 +2014,6 @@ async def rp_ask_preview(ev, state):
     )
 
 
-@router.callback_query(RepeatNew.content, F.data == "rp_done")
-async def rp_done(cb: CallbackQuery, state: FSMContext):
-    contents = await coll_take(cb, state)
-    if not contents:
-        return
-    await state.update_data(content=contents[0])
-    if any(has_link(c) for c in contents):
-        await rp_ask_preview(cb, state)
-    else:
-        await rep_ask_days(cb, state)
-
-
 @router.callback_query(RepeatNew.preview, F.data == "rp_bk_c")
 async def rp_back_collect(cb: CallbackQuery, state: FSMContext):
     await state.set_state(RepeatNew.content)
@@ -1649,16 +2026,7 @@ async def rp_preview(cb: CallbackQuery, state: FSMContext):
     await rep_ask_days(cb, state)
 
 
-@router.callback_query(RepeatNew.days, F.data == "rpd_bk")
-async def rp_days_back(cb: CallbackQuery, state: FSMContext):
-    d = await state.get_data()
-    if any(has_link(c) for c in d["contents"]):
-        await rp_ask_preview(cb, state)
-    else:
-        await state.set_state(RepeatNew.content)
-        await coll_edit(cb, state, "rp")
-
-
+# ---- days
 async def rep_ask_days(ev, state):
     d = await state.get_data()
     await state.set_state(RepeatNew.days)
@@ -1667,6 +2035,18 @@ async def rep_ask_days(ev, state):
         "📅 <b>Which days?</b>\n\nTap the days to select or unselect them.",
         day_kb(d["days"], "rpd", ("➡️ Next", "rpd:ok"), ("⬅️ Back", "rpd_bk"), ("❌ Cancel", "menu")),
     )
+
+
+@router.callback_query(RepeatNew.days, F.data == "rpd_bk")
+async def rp_days_back(cb: CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    if d.get("origin") == "np":
+        return await ask_when(cb, state)  # back to the Send Now / Repeat screen
+    if any(has_link(c) for c in d["contents"]):
+        await rp_ask_preview(cb, state)
+    else:
+        await state.set_state(RepeatNew.content)
+        await coll_edit(cb, state, "rp")
 
 
 @router.callback_query(RepeatNew.days, F.data.startswith("rpd:"))
@@ -1682,6 +2062,7 @@ async def rp_days(cb: CallbackQuery, state: FSMContext):
     await rep_ask_days(cb, state)
 
 
+# ---- times
 async def rep_ask_times(ev, state):
     await state.set_state(RepeatNew.times)
     await show(ev, times_text(), kb([[("⬅️ Back", "rpt_back"), ("❌ Cancel", "menu")]]))
@@ -1703,6 +2084,7 @@ async def rp_times(m: Message, state: FSMContext):
     await rep_ask_end(m, state)
 
 
+# ---- end
 async def rep_ask_end(ev, state):
     await state.set_state(RepeatNew.end)
     await show(
@@ -1737,7 +2119,7 @@ async def rp_end(cb: CallbackQuery, state: FSMContext):
     k = cb.data.split(":")[1]
     if k == "never":
         await state.update_data(end_type="never", end_count=None, end_date=None)
-        return await rep_ask_delete(cb, state)
+        return await rep_ask_start(cb, state)
     if k == "count":
         await state.set_state(RepeatNew.end_count)
         return await show(
@@ -1762,7 +2144,7 @@ async def rp_count_msg(m: Message, state: FSMContext):
     if not re.fullmatch(r"\d{1,4}", txt) or not 1 <= int(txt) <= 1000:
         return await reply(m, "Send a number between 1 and 1000, for example <code>10</code>.")
     await state.update_data(end_type="count", end_count=int(txt), end_date=None)
-    await rep_ask_delete(m, state)
+    await rep_ask_start(m, state)
 
 
 @router.callback_query(RepeatNew.end_date, F.data.startswith("rpc:"))
@@ -1772,7 +2154,7 @@ async def rp_calendar(cb: CallbackQuery, state: FSMContext):
         return await show_calendar(cb, int(parts[2]), int(parts[3]))
     s = parts[2]
     await state.update_data(end_type="date", end_date=f"{s[:4]}-{s[4:6]}-{s[6:]}", end_count=None)
-    await rep_ask_delete(cb, state)
+    await rep_ask_start(cb, state)
 
 
 @router.message(RepeatNew.end_date)
@@ -1789,18 +2171,29 @@ async def rp_end_date_msg(m: Message, state: FSMContext):
     if dt < datetime.now(TZ).date():
         return await reply(m, "That date is in the past. Send a future date.")
     await state.update_data(end_type="date", end_date=dt.isoformat(), end_count=None)
-    await rep_ask_delete(m, state)
+    await rep_ask_start(m, state)
 
 
-async def rep_ask_delete(ev, state):
+# ---- auto-delete + pin, one message at a time
+async def rep_ask_start(ev, state):
     d = await state.get_data()
+    n = len(d["contents"])
+    await state.update_data(delete_afters=[None] * n, pins=[0] * n)
+    await rep_ask_msg(ev, state, 0)
+
+
+async def rep_ask_msg(ev, state, idx):
+    d = await state.get_data()
+    await state.update_data(idx=idx)
     await state.set_state(RepeatNew.delete)
     rows = del_rows("rp_del:")
+    rows.append([pin_btn("rp_pin", d["pins"][idx])])
     rows.append([("♻️ Replace previous: ON" if d["replace_prev"] else "♻️ Replace previous: OFF", "rp_rep")])
     rows.append([("⬅️ Back", "rpx_back"), ("❌ Cancel", "menu")])
     await show(
         ev,
-        del_text()
+        msg_head(d["contents"][idx], idx, len(d["contents"]))
+        + del_text()
         + "\n\n♻️ Replace previous: when ON, the previous post of this repeat is deleted "
         "as soon as the new one is posted.",
         kb(rows),
@@ -1809,20 +2202,43 @@ async def rep_ask_delete(ev, state):
 
 @router.callback_query(RepeatNew.delete, F.data == "rpx_back")
 async def rp_del_back(cb: CallbackQuery, state: FSMContext):
-    await rep_ask_end(cb, state)
+    d = await state.get_data()
+    if d["idx"] > 0:
+        await rep_ask_msg(cb, state, d["idx"] - 1)
+    else:
+        await rep_ask_end(cb, state)
 
 
 @router.callback_query(RepeatNew.delete, F.data == "rp_rep")
 async def rp_toggle_replace(cb: CallbackQuery, state: FSMContext):
     d = await state.get_data()
     await state.update_data(replace_prev=0 if d["replace_prev"] else 1)
-    await rep_ask_delete(cb, state)
+    await rep_ask_msg(cb, state, d["idx"])
+
+
+@router.callback_query(RepeatNew.delete, F.data == "rp_pin")
+async def rp_toggle_pin(cb: CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    pins, i = list(d["pins"]), d["idx"]
+    pins[i] = 0 if pins[i] else 1
+    await state.update_data(pins=pins)
+    await rep_ask_msg(cb, state, i)
+
+
+async def rp_set_delete(ev, state, sec):
+    d = await state.get_data()
+    das, i = list(d["delete_afters"]), d["idx"]
+    das[i] = sec or None
+    await state.update_data(delete_afters=das)
+    if i + 1 < len(d["contents"]):
+        await rep_ask_msg(ev, state, i + 1)
+    else:
+        await rep_ask_confirm(ev, state)
 
 
 @router.callback_query(RepeatNew.delete, F.data.startswith("rp_del:"))
 async def rp_del_cb(cb: CallbackQuery, state: FSMContext):
-    await state.update_data(delete_after=int(cb.data.split(":")[1]) or None)
-    await rep_ask_confirm(cb, state)
+    await rp_set_delete(cb, state, int(cb.data.split(":")[1]))
 
 
 @router.message(RepeatNew.delete)
@@ -1830,19 +2246,21 @@ async def rp_del_msg(m: Message, state: FSMContext):
     sec = parse_duration(m.text or "")
     if not sec:
         return await reply(m, "Invalid duration. Examples: <code>45m</code>, <code>3h</code>, <code>2d 12h</code>")
-    await state.update_data(delete_after=sec)
-    await rep_ask_confirm(m, state)
+    await rp_set_delete(m, state, sec)
 
 
+# ---- review + create
 async def rep_ask_confirm(ev, state):
     d = await state.get_data()
-    ch = await db.channel(d["chat_id"])
-    if not ch:
+    names = {c["chat_id"]: c["title"] for c in await db.channels()}
+    titles = [names[c] for c in d["chat_ids"] if c in names]
+    if not titles:
         await state.clear()
         return await show(ev, "That channel no longer exists.", kb([[("⬅️ Menu", "menu")]]))
     await state.set_state(RepeatNew.confirm)
     nxt = occurrences(d["days"], d["times"], int(time.time()), TZ, end_date_of(d), 3)
-    L = ["<b>Review your repeat post</b>", ""] + rule_lines(d, ch["title"]) + ["", "⏭ Next posts:"]
+    label = "Channel" if len(titles) == 1 else f"Channels ({len(titles)})"
+    L = ["<b>Review your repeat post</b>", ""] + rule_lines(d, ", ".join(titles), label) + ["", "⏭ Next posts:"]
     L += [f"• {fmt_dt(t)}" for t in nxt] or ["• none (check days, times and end date)"]
     sil = "🔕 Silent: ON" if d["silent"] else "🔔 Silent: OFF"
     await show(
@@ -1861,7 +2279,8 @@ async def rp_silent(cb: CallbackQuery, state: FSMContext):
 
 @router.callback_query(RepeatNew.confirm, F.data == "rpx_bk_cf")
 async def rp_back_confirm(cb: CallbackQuery, state: FSMContext):
-    await rep_ask_delete(cb, state)
+    d = await state.get_data()
+    await rep_ask_msg(cb, state, len(d["contents"]) - 1)
 
 
 @router.callback_query(RepeatNew.confirm, F.data == "rp_ok")
@@ -1870,27 +2289,40 @@ async def rp_ok(cb: CallbackQuery, state: FSMContext):
     nxt = occurrences(d["days"], d["times"], int(time.time()), TZ, end_date_of(d), 1)
     if not nxt:
         return await safe_answer(cb, "No upcoming post matches these settings. Change the days, times or end date.", True)
-    rid = await db.create_repeat(
-        owner_id=cb.from_user.id,
-        chat_id=d["chat_id"],
-        content=d["contents"][0],
-        contents=d["contents"],
-        link_preview=d["preview"],
-        silent=d["silent"],
-        days=d["days"],
-        times=d["times"],
-        end_type=d["end_type"],
-        end_count=d["end_count"],
-        end_date=d["end_date"],
-        delete_after=d.get("delete_after"),
-        replace_prev=d.get("replace_prev", 0),
-        next_run=nxt[0],
-    )
+    known = {c["chat_id"] for c in await db.channels()}
+    cids = [c for c in d["chat_ids"] if c in known]
+    rids = []
+    for cid in cids:
+        rids.append(
+            await db.create_repeat(
+                owner_id=cb.from_user.id,
+                chat_id=cid,
+                content=d["contents"][0],
+                contents=d["contents"],
+                link_preview=d["preview"],
+                silent=d["silent"],
+                days=d["days"],
+                times=d["times"],
+                end_type=d["end_type"],
+                end_count=d["end_count"],
+                end_date=d["end_date"],
+                delete_after=d["delete_afters"][0],
+                delete_afters=d["delete_afters"],
+                pins=d["pins"],
+                replace_prev=d.get("replace_prev", 0),
+                next_run=nxt[0],
+            )
+        )
+    trash_forget(cb.message.chat.id)
     await state.clear()
+    if len(rids) == 1:
+        text = f"✅ Repeat <b>R{rids[0]}</b> created.\n\n⏭ First post: {fmt_dt(nxt[0])}"
+    else:
+        text = f"✅ Repeats <b>R{rids[0]} to R{rids[-1]}</b> created in {len(rids)} channels.\n\n⏭ First post: {fmt_dt(nxt[0])}"
     await show(
         cb,
-        f"✅ Repeat <b>R{rid}</b> created.\n\n⏭ First post: {fmt_dt(nxt[0])}",
-        kb([[("🔁 Repeating", f"rlist:0:{d['chat_id']}"), ("⬅️ Menu", "menu")]]),
+        text,
+        kb([[("🔁 Repeating", f"rlist:0:{cids[0] if len(cids) == 1 else 0}"), ("⬅️ Menu", "menu")]]),
     )
 
 
@@ -1944,7 +2376,7 @@ async def show_repeat(ev, rid):
         rows = [
             [("▶️ Resume" if r["paused"] else "⏸ Pause", f"rp:pause:{rid}"), ("✏️ Edit", f"rp:edit:{rid}")],
             [("📅 Days", f"rp:days:{rid}"), ("🕒 Times", f"rp:times:{rid}")],
-            [("🗑 Auto-delete", f"rp:del:{rid}"), (f"♻️ Replace: {'ON' if r['replace_prev'] else 'OFF'}", f"rp:rep:{rid}")],
+            [("🗑 Delete & 📌 Pin", f"rp:del:{rid}"), (f"♻️ Replace: {'ON' if r['replace_prev'] else 'OFF'}", f"rp:rep:{rid}")],
             [("⏭ Skip Next", f"rp:skip:{rid}"), ("⚡ Send Now", f"rp:now:{rid}")],
             tog,
             [("👁 View", f"rp:view:{rid}"), ("❌ Delete", f"rp:delask:{rid}")],
@@ -1955,6 +2387,9 @@ async def show_repeat(ev, rid):
 
 @router.callback_query(F.data.startswith("r:"))
 async def cb_repeat(cb: CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    if d.get("phase") == "preview":
+        await coll_drop_previews(cb.bot, cb.message.chat.id, state, keep=cb.message.message_id)
     await state.clear()
     await show_repeat(cb, int(cb.data.split(":")[1]))
 
@@ -2015,7 +2450,7 @@ async def cb_rp(cb: CallbackQuery, state: FSMContext, bot: Bot):
         await db.set_repeat(rid, next_run=nxt, status="active" if nxt else "ended")
         await safe_answer(cb, "Skipped the next post.")
     elif act == "now":
-        for c in rule_contents(r):
+        for i, c in enumerate(rule_contents(r)):
             await db.create_post(
                 owner_id=cb.from_user.id,
                 chat_id=r["chat_id"],
@@ -2023,7 +2458,8 @@ async def cb_rp(cb: CallbackQuery, state: FSMContext, bot: Bot):
                 link_preview=r["link_preview"],
                 silent=r["silent"],
                 send_at=now,
-                delete_after=r["delete_after"],
+                delete_after=rule_da(r, i),
+                pin=rule_pin(r, i),
                 repeat_id=rid,
                 replace_prev=r["replace_prev"],
                 run_id=now,
@@ -2036,10 +2472,19 @@ async def cb_rp(cb: CallbackQuery, state: FSMContext, bot: Bot):
     elif act == "sil":
         await db.set_repeat(rid, silent=0 if r["silent"] else 1)
     elif act == "edit":
+        trash_forget(cb.message.chat.id)
         prompt = f"✏️ <b>Edit repeat R{rid}</b>\n\n{PROMPT_MULTI}\n\nThe new messages replace the old ones."
         await state.set_state(RepeatEdit.content)
         await state.set_data(
-            {"rid": rid, "items": [], "ctrl_id": None, "coll_back": f"r:{rid}", "coll_prompt": prompt}
+            {
+                "rid": rid,
+                "items": [],
+                "ctrl_id": None,
+                "pfx": "re",
+                "phase": "collect",
+                "coll_back": f"r:{rid}",
+                "coll_prompt": prompt,
+            }
         )
         return await show(cb, prompt, kb([[("⬅️ Back", f"r:{rid}")]]))
     elif act == "days":
@@ -2051,9 +2496,17 @@ async def cb_rp(cb: CallbackQuery, state: FSMContext, bot: Bot):
         await state.set_data({"rid": rid})
         return await show(cb, times_text(r["times"]), kb([[("⬅️ Back", f"r:{rid}")]]))
     elif act == "del":
+        n = len(rule_contents(r))
         await state.set_state(RepeatEdit.delete)
-        await state.set_data({"rid": rid})
-        return await show(cb, del_text(), kb(del_rows(f"rd:{rid}:", ("⬅️ Back", f"r:{rid}"))))
+        await state.set_data(
+            {
+                "rid": rid,
+                "idx": 0,
+                "das": [rule_da(r, i) for i in range(n)],
+                "pins": [rule_pin(r, i) for i in range(n)],
+            }
+        )
+        return await re_ask_msg(cb, state)
     await show_repeat(cb, rid)
 
 
@@ -2098,18 +2551,27 @@ async def re_content(m: Message, state: FSMContext):
     await coll_add(m, state, "re")
 
 
-@router.callback_query(RepeatEdit.content, F.data == "re_undo")
-async def re_undo(cb: CallbackQuery, state: FSMContext):
-    await coll_undo(cb, state, "re")
-
-
 @router.callback_query(RepeatEdit.content, F.data == "re_done")
 async def re_done(cb: CallbackQuery, state: FSMContext):
-    contents = await coll_take(cb, state)
+    await coll_preview(cb, state, "re")
+
+
+@router.callback_query(RepeatEdit.content, F.data == "re_more")
+async def re_more(cb: CallbackQuery, state: FSMContext):
+    await coll_more(cb, state, "re")
+
+
+@router.callback_query(RepeatEdit.content, F.data == "re_go")
+async def re_go(cb: CallbackQuery, state: FSMContext):
+    contents = await coll_go(cb, state)
     if not contents:
         return
     rid = (await state.get_data())["rid"]
-    await db.set_repeat(rid, content=contents[0], contents=contents, link_preview=0)
+    old = await db.repeat(rid)
+    n_old = len(rule_contents(old)) if old else 0
+    das = [rule_da(old, i) if i < n_old else None for i in range(len(contents))]
+    pins = [rule_pin(old, i) if i < n_old else 0 for i in range(len(contents))]
+    await db.set_repeat(rid, content=contents[0], contents=contents, link_preview=0, delete_afters=das, pins=pins)
     await state.clear()
     if any(has_link(c) for c in contents):
         return await show(
@@ -2132,12 +2594,52 @@ async def re_preview(cb: CallbackQuery):
     await show_repeat(cb, int(rid))
 
 
-@router.callback_query(F.data.startswith("rd:"))
-async def rd_cb(cb: CallbackQuery, state: FSMContext):
-    _, rid, sec = cb.data.split(":")
+async def re_ask_msg(ev, state):
+    d = await state.get_data()
+    r = await db.repeat(d["rid"])
+    if not r:
+        await state.clear()
+        return await show(ev, "Repeat not found.", kb([[("⬅️ Back", "sch")]]))
+    cs, idx = rule_contents(r), d["idx"]
+    rows = del_rows("rd:") + [[pin_btn("rd_pin", d["pins"][idx])], [("⬅️ Back", "rd_bk")]]
+    await show(ev, msg_head(cs[idx], idx, len(cs)) + del_text(), kb(rows))
+
+
+@router.callback_query(RepeatEdit.delete, F.data == "rd_pin")
+async def rd_toggle_pin(cb: CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    pins = list(d["pins"])
+    pins[d["idx"]] = 0 if pins[d["idx"]] else 1
+    await state.update_data(pins=pins)
+    await re_ask_msg(cb, state)
+
+
+@router.callback_query(RepeatEdit.delete, F.data == "rd_bk")
+async def rd_back(cb: CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    if d["idx"] > 0:
+        await state.update_data(idx=d["idx"] - 1)
+        return await re_ask_msg(cb, state)
     await state.clear()
-    await db.set_repeat(int(rid), delete_after=int(sec) or None)
-    await show_repeat(cb, int(rid))
+    await show_repeat(cb, d["rid"])
+
+
+async def re_set_delete(ev, state, sec):
+    d = await state.get_data()
+    das, i = list(d["das"]), d["idx"]
+    das[i] = sec or None
+    await state.update_data(das=das)
+    if i + 1 < len(das):
+        await state.update_data(idx=i + 1)
+        return await re_ask_msg(ev, state)
+    await db.set_repeat(d["rid"], delete_afters=das, pins=d["pins"], delete_after=das[0])
+    await state.clear()
+    await show_repeat(ev, d["rid"])
+
+
+@router.callback_query(RepeatEdit.delete, F.data.startswith("rd:"))
+async def rd_cb(cb: CallbackQuery, state: FSMContext):
+    await re_set_delete(cb, state, int(cb.data.split(":")[2]))
 
 
 @router.message(RepeatEdit.delete)
@@ -2145,10 +2647,7 @@ async def re_del_msg(m: Message, state: FSMContext):
     sec = parse_duration(m.text or "")
     if not sec:
         return await reply(m, "Invalid duration. Examples: <code>45m</code>, <code>3h</code>, <code>2d 12h</code>")
-    rid = (await state.get_data())["rid"]
-    await state.clear()
-    await db.set_repeat(rid, delete_after=sec)
-    await show_repeat(m, rid)
+    await re_set_delete(m, state, sec)
 
 
 # ----------------------------------------------------------------- repeat: firing
@@ -2171,7 +2670,7 @@ async def fire_repeat(bot: Bot, r):
         status="ended" if ended else "active",
     )
     if create:
-        for c in rule_contents(r):
+        for i, c in enumerate(rule_contents(r)):
             await db.create_post(
                 owner_id=r["owner_id"],
                 chat_id=r["chat_id"],
@@ -2179,7 +2678,8 @@ async def fire_repeat(bot: Bot, r):
                 link_preview=r["link_preview"],
                 silent=r["silent"],
                 send_at=now,
-                delete_after=r["delete_after"],
+                delete_after=rule_da(r, i),
+                pin=rule_pin(r, i),
                 repeat_id=r["id"],
                 replace_prev=r["replace_prev"],
                 run_id=now,
@@ -2247,10 +2747,19 @@ async def publish(bot: Bot, p):
         delete_at=da,
         error=None,
     )
+    pin_note = ""
+    if p.get("pin"):
+        try:
+            await bot.pin_chat_message(chat_id=p["chat_id"], message_id=msgs[0].message_id, disable_notification=True)
+            await db.set(p["id"], pinned=True)
+            pin_note = "\n📌 Pinned"
+        except Exception as e:
+            pin_note = f"\n⚠️ Could not pin: {esc(str(e)[:120])}"
     ch = await db.channel(p["chat_id"])
     text = f"✅ Posted to <b>{esc(ch['title']) if ch else p['chat_id']}</b>\n📝 {esc(plain(p['content'], 60))}"
     if da:
         text += f"\n🗑 Auto-deletes at {fmt_dt(da)}"
+    text += pin_note
     st = await status_task
     await edit_status(bot, st, uid, text, kb([[("📋 Manage Post", f"p:{p['id']}")]]))
     # repeat option "Replace previous": remove the older post(s) of the same repeat
@@ -2285,46 +2794,4 @@ async def remove_live(bot: Bot, p):
 
 
 async def scheduler(bot: Bot):
-    """Sleeps until the exact next due time (or until something changes), so posts go out on the second."""
-    while True:
-        nxt = None
-        try:
-            now = int(time.time())
-            for r in await db.due_repeats(now):
-                await fire_repeat(bot, r)
-            for p in await db.due_posts(now):
-                if await db.claim(p["id"]):
-                    await publish(bot, p)
-            for p in await db.due_deletes(now):
-                await remove_live(bot, p)
-            nxt = await db.next_due()
-        except Exception:
-            log.exception("Scheduler error")
-        delay = 5.0 if nxt is None else min(5.0, max(0.05, nxt - time.time()))
-        try:
-            await asyncio.wait_for(db.changed.wait(), timeout=delay)
-        except asyncio.TimeoutError:
-            pass
-        db.changed.clear()
-
-
-async def main():
-    if not OWNERS:
-        log.warning("OWNER_IDS is empty. Send /id to the bot, then set OWNER_IDS and redeploy.")
-    await db.init()
-    await db.reset_sending()
-    bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(public)
-    dp.include_router(router)
-    task = asyncio.create_task(scheduler(bot))
-    await bot.delete_webhook(drop_pending_updates=True)
-    log.info("Bot started")
-    try:
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-    finally:
-        task.cancel()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    """Sleeps until the exact next due time (or until something changes), so posts go out
