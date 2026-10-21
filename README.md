@@ -22,6 +22,10 @@
 | 🖼  | All message types: text, photo, video, document, GIF, audio, voice, sticker and albums                                |
 | ⏰  | Schedule by time, exact date or delay (`18:30`, `25-12-2026 18:30`, `2h`), or **Send Now**                             |
 | 🗑  | Auto-delete timer for every post (presets or a custom time)                                                           |
+| 📣  | Post to many channels with one click: tick the channels (or Select All) and every message goes to all of them |
+| 👀  | Preview all your messages before posting, with a 🗑 Remove button under each one                          |
+| 🗑  | A separate auto-delete timer for every message, in New Post and in Repeat                                |
+| 📌  | Pin any message when it is posted, and Pin / Unpin live posts later from the bot                         |
 | 🔁  | Repeat posts: pick Mon to Sun (or Every day / Weekdays / Weekend), one or more times a day, stop never / after N / on a date |
 | ⏸  | Pause, resume, skip next, edit messages, days and times of a repeat                                                   |
 | ♻️ | Replace previous: the new post goes out, then the old one is deleted, so the channel always shows the latest          |
@@ -30,7 +34,7 @@
 | ✏️ | Edit already published posts (text or caption) and change link preview from the bot                                   |
 | 🔕  | Silent posts (no notification)                                                                                        |
 | ⏳  | Live status: `Posting… Please wait`, then `Posted`. Failed posts can be retried with one tap                          |
-| ⬅️ | Back button on every screen                                                                                           |
+| ⬅️ | Back button on every screen, and Cancel removes the messages of that flow                                                                                           |
 | 🔒  | Private bot: only the owners can use it                                                                               |
 | 🗄  | MongoDB storage: scheduled posts and repeats are safe across restarts and redeploys                                   |
 
@@ -100,6 +104,7 @@ The start command is already set in `Procfile` (`python bot.py`).
 - A repeat run that is more than 1 hour late is skipped, so old posts are never sent in a burst.
 - Albums can have 2 to 10 photos or videos, or only documents, or only audio files (Telegram rule). Its caption is used as the post caption.
 - Telegram may refuse to delete very old messages (around 48 hours). The bot tells you if that happens.
+- Pinning needs the **Edit messages** admin right in the channel.
 - Published posts can only have their text or caption edited. The media itself cannot be changed.
 
 </details>
