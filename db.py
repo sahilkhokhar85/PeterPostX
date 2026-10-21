@@ -203,6 +203,8 @@ class DB:
             "last_run": None,
             "next_run": None,
             "delete_after": None,
+            "delete_afters": None,
+            "pins": None,
             "replace_prev": 0,
             "link_preview": 0,
             "silent": 0,
