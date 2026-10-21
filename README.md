@@ -17,7 +17,7 @@
 
 |    | Feature                                                                                                               |
 | --- | --------------------------------------------------------------------------------------------------------------------- |
-| 📺  | Many channels: add one by making the bot an admin (detected automatically), or forward a message / send its ID        |
+| 📺  | Mxany channels: add one by making the bot an admin (detected automatically), or forward a message / send its ID        |
 | 📝  | New Post: send as many messages as you want, tap **Done**. Each message becomes its own post, sent in order           |
 | 🖼  | All message types: text, photo, video, document, GIF, audio, voice, sticker and albums                                |
 | ⏰  | Schedule by time, exact date or delay (`18:30`, `25-12-2026 18:30`, `2h`), or **Send Now**                             |
