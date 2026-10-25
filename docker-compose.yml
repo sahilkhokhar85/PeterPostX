@@ -1,0 +1,6 @@
+services:
+  peterpostx:
+    build: .
+    container_name: peterpostx
+    restart: always
+    env_file: .env
